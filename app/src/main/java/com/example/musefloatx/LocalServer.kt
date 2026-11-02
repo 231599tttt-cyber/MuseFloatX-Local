@@ -75,15 +75,44 @@ object LocalServer {
     @Volatile var lastError: String? = null
         private set
 
-    fun modelFile(context: Context): File {
-        return File(File(context.filesDir, "models"), LocalConfig.MODEL_FILE_NAME)
+    /** 当前选用的模型规格（SettingsStore.selectedModel，默认 2B）。 */
+    fun selectedModel(context: Context): LocalModel {
+        return try {
+            SettingsStore(context).selectedModel
+        } catch (_: Exception) {
+            LocalConfig.MODEL_2B
+        }
     }
 
-    fun isModelDownloaded(context: Context): Boolean {
-        val f = modelFile(context)
-        // 大小校验：必须接近 1.40GB，差 1% 以上算没下完或损坏。
-        return f.exists() && f.length() > LocalConfig.MODEL_EXPECTED_BYTES * 99 / 100 &&
-            f.length() < LocalConfig.MODEL_EXPECTED_BYTES * 101 / 100
+    /**
+     * 当前选用的思考模式（SettingsStore.reasoningMode，默认 "off"）。
+     * 绝不能在这里写死 "off"：思考模式是用户可选的，见 MainActivity
+     * 的“思考模式”选择器；改动后要先 stop() 再启动才会生效。
+     * runningReasoningMode 记录的是当前正在跑的服务用的值，
+     * 如果和用户新选的值不一致，ensureStarted() 会先杀掉旧服务再重起。
+     */
+    fun reasoningMode(context: Context): String {
+        return try {
+            SettingsStore(context).reasoningMode
+        } catch (_: Exception) {
+            "off"
+        }
+    }
+
+    @Volatile private var runningReasoningMode: String? = null
+        private set
+
+    /** 指定模型的落盘文件；不传模型时用当前选用模型。 */
+    fun modelFile(context: Context, model: LocalModel = selectedModel(context)): File {
+        return File(File(context.filesDir, "models"), model.fileName)
+    }
+
+    /** 指定模型是否已下载：文件存在且大小在官方大小 ±1% 内才算。 */
+    fun isModelDownloaded(context: Context, model: LocalModel = selectedModel(context)): Boolean {
+        val f = modelFile(context, model)
+        // 大小校验：必须接近官方大小，差 1% 以上算没下完或损坏。
+        return f.exists() && f.length() > model.expectedBytes * 99 / 100 &&
+            f.length() < model.expectedBytes * 101 / 100
     }
 
     /** 原生库目录里的推理程序：APK 安装时从 lib/arm64-v8a/ 解压到这里。 */
@@ -120,7 +149,17 @@ object LocalServer {
             sb.append("\n")
             sb.append("可执行标记：").append(if (bin.canExecute()) "是" else "否（系统解压时一般自带可执行权限，否也不一定就是失败原因，看下面报错原文）").append("\n")
         }
-        sb.append("模型已下载：").append(if (isModelDownloaded(context)) "是" else "否").append("\n")
+        val selected = selectedModel(context)
+        sb.append("当前选用模型：").append(selected.displayName).append("\n")
+        sb.append("思考模式（用户选择）：").append(reasoningMode(context))
+            .append("（off=关闭快，auto=自动，on=开启慢但可能更准）\n")
+        sb.append("正在跑的服务用的思考模式：").append(runningReasoningMode ?: "（服务没在跑）").append("\n")
+        sb.append("当前模型文件：").append(modelFile(context, selected).absolutePath).append("\n")
+        sb.append("当前模型已下载：").append(if (isModelDownloaded(context, selected)) "是" else "否").append("\n")
+        for (m in LocalConfig.MODELS) {
+            sb.append("模型 ").append(m.displayName).append(" 已下载：")
+                .append(if (isModelDownloaded(context, m)) "是" else "否").append("\n")
+        }
         sb.append("服务在跑：").append(if (isRunning && process?.isAlive == true) "是" else "否").append("\n")
         sb.append("最后一次报错：").append(lastError ?: "（无）").append("\n")
         sb.append("进程日志尾部：\n").append(serverLogTail(context))
@@ -211,12 +250,25 @@ object LocalServer {
 
     /** 悬浮球启动时调：模型没下好直接报错，不启动空服务。 */
     suspend fun ensureStarted(context: Context, contextTokens: Int): Boolean = mutex.withLock {
+        val wantedReasoning = reasoningMode(context)
         if (isRunning && process?.isAlive == true) {
-            cancelIdleUnloadLocked()
-            return true
+            if (runningReasoningMode == wantedReasoning) {
+                cancelIdleUnloadLocked()
+                return true
+            }
+            // 思考模式被用户改了：只改设置不重启是不会生效的，
+            // 这里先杀掉用旧模式跑的服务，下面按新模式重新启动。
+            // stop() 里有 2 秒等待，但它不抢 mutex，不会死锁。
+            try { process?.destroyForcibly() } catch (_: Exception) {}
+            process = null
+            isRunning = false
+            runningReasoningMode = null
         }
-        if (!isModelDownloaded(context)) {
-            lastError = "模型还没下载好，请先回主界面下载模型（约 1.40GB）"
+        // 关键：按当前选用模型加载，不再写死 2B。切换模型后这里读到的
+        // 就是新模型的文件和 alias；旧模型文件还留在手机里，不会被删。
+        val selected = selectedModel(context)
+        if (!isModelDownloaded(context, selected)) {
+            lastError = "模型还没下载好：当前选用的是 ${selected.displayName}，请先回主界面下载它（${selected.approxSizeLabel}），或先切换回已下载的模型"
             return false
         }
         val bin = serverBinary(context)
@@ -237,8 +289,8 @@ object LocalServer {
             val ctx = contextTokens.coerceIn(512, 4096)
             val args = listOf(
                 bin.absolutePath,
-                "-m", modelFile(context).absolutePath,
-                "--alias", LocalConfig.LOCAL_MODEL_NAME,
+                "-m", modelFile(context, selected).absolutePath,
+                "--alias", selected.alias,
                 "--host", "127.0.0.1",
                 "--port", LocalConfig.LOCAL_PORT.toString(),
                 "-c", ctx.toString(),
@@ -246,19 +298,22 @@ object LocalServer {
                 // 注意：不要传 --mmap，新版 llama-server 不认这个参数，
                 // 传了就报 invalid argument: --mmap、exitCode=1 提前退出。
                 // mmap 本来就是默认的，不传就是 mmap。
-                // 推理开关（2026-11-02 实测验证，非假设）：
+                // 推理开关（2026-11-02 实测验证，非假设；2026-11-02 后改为用户可选）：
                 // 当前工作流克隆的最新 llama.cpp 里 common/arg.cpp 明确有
                 // {"-rea", "--reasoning"}, "[on|off|auto]",
                 // "Use reasoning/thinking in the chat ('on', 'off', or 'auto',
                 // default: 'auto' (detect from template))"，
-                // 所以 --reasoning off 是本版 llama-server 真实支持的参数，
-                // 不是猜的。用户明确要求不要优先用 --chat-template-kwargs，
-                // 因此这里只用 --reasoning off，不传 --chat-template-kwargs。
+                // 所以 --reasoning 是本版 llama-server 真实支持的参数，
+                // 不是猜的。值绝不能在这里写死 "off"：它来自
+                // reasoningMode(context)，即用户在主界面选的思考模式
+                // （off=关闭快，auto=自动，on=开启慢但可能更准）。
+                // 用户明确要求不要优先用 --chat-template-kwargs，
+                // 因此这里只用 --reasoning，不传 --chat-template-kwargs。
                 // 如果将来 llama.cpp 删掉这个参数，启动会像 --mmap 那样
                 // 直接报 invalid argument、exitCode=1，工作流里有
                 // grep 校验（见 .github/workflows/build-local-apk.yml），
                 // 缺了这个参数定义就先构建失败，不会静默发一个坏 APK。
-                "--reasoning", "off",
+                "--reasoning", wantedReasoning,
                 "-b", "512",
                 "--log-disable"
                 // 注意：故意不传 --chat-template，让模型自带模板决定非思考模式。
@@ -287,6 +342,7 @@ object LocalServer {
                 delay(500)
             }
             isRunning = ok
+            runningReasoningMode = if (ok) wantedReasoning else null
             if (!ok) {
                 val tail = serverLogTail(context)
                 lastError = if (exitCode != null) {
@@ -306,6 +362,7 @@ object LocalServer {
             try { process?.destroyForcibly() } catch (_: Exception) {}
             process = null
             isRunning = false
+            runningReasoningMode = null
             false
         }
     }
@@ -353,6 +410,7 @@ object LocalServer {
         } catch (_: Exception) {}
         process = null
         isRunning = false
+        runningReasoningMode = null
     }
 
     /** 供 MainActivity 测试/诊断用：不经过 FloatingService 也能起服务，测完同样会闲置卸载。 */

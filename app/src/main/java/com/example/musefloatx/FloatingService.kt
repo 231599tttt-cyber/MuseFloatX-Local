@@ -523,7 +523,15 @@ class FloatingService : Service() {
             // 那就是第二次提交、第二次生成、第二次传输，只会更慢。
             // 直接报错，用户等当前结束、再点重新生成，那才是新的一次提交。
             val streamResult = ApiClient.generateStream(this@FloatingService, store.contextTokens, styleState, text) { piece ->
-                if (mySeq == generateSeq) replyText += piece
+                if (mySeq == generateSeq) {
+                    replyText += piece
+                    // 第二层防闪烁：ApiClient 流里已经按块去开头 null，
+                    // 这里再兜底一次——万一累积文本开头出现 null，
+                    // 立刻清掉，绝不让 null 在面板上闪一下再被最终文本覆盖。
+                    // 句中 null 不动，只清开头。
+                    val cleaned = ApiClient.stripLeadingNull(replyText)
+                    if (cleaned != replyText) replyText = cleaned
+                }
             }
             if (mySeq != generateSeq) return@launch
             if (streamResult.isSuccess) {

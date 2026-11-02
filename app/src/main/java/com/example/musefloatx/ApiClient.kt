@@ -16,15 +16,17 @@ import java.util.concurrent.TimeUnit
  * 本地版 ApiClient：不再调任何远程服务，只调本机 llama-server。
  *
  * - 地址固定 http://127.0.0.1:8080（LocalConfig.LOCAL_BASE_URL），
- *   模型名固定 Qwen3.5-2B（llama-server 启动时 --alias 起的名），
- *   没有 API 密钥——只绑回环，外面连不进来，请求里仍带一个本地占位 Bearer，
+ *   模型名是当前选用模型的 alias（llama-server 启动时 --alias 起的名，
+ *   2B 或 4B，不能写死），没有 API 密钥——只绑回环，外面连不进来，
+ *   请求里仍带一个本地占位 Bearer，
  *   只是为了让 OpenAI 兼容格式完整，服务器没设密钥时会被忽略。
  * - 生成前先调 LocalServer.ensureStarted()：悬浮球启动时加载、
  *   生成结束 10 分钟闲置自动卸载，这里的 ensureStarted 只是确认服务在跑，
  *   不会把模型常驻。
- * - 推理开关（2026-11-02 改）：llama-server 启动时传 --reasoning off
- *   （LocalServer.kt，已在当前 llama.cpp 源码里核实支持），
- *   这是服务端一级的关思考办法；不优先用 --chat-template-kwargs。
+ * - 推理开关（2026-11-02 改为用户可选，默认 off）：llama-server 启动时
+ *   传 --reasoning（LocalServer.kt，已在当前 llama.cpp 源码里核实支持），
+ *   值来自用户在主界面选的思考模式（off/auto/on），
+ *   这是服务端一级的思考办法；不优先用 --chat-template-kwargs。
  *   下面的 ThinkFilter 只是兜底：万一输出里混进 <think> 段，
  *   就地丢掉，不显示、不进最终回复。空回复时不要只猜是思考导致，
  *   看 generate() 记下的 lastGenerationDiagnostics（finish_reason、
@@ -100,13 +102,20 @@ object ApiClient {
             }
             val stripped = ThinkFilter.stripAll(content)
             val preview = content.take(200).replace("\n", " ")
+            // 思考内容绝不能被当成正文：reasoning 只进诊断，不进 Pair 的正文。
+            // 正文为空、但思考非空时，要在诊断里明说——这就是思考耗尽
+            // token 预算的典型信号，不要只报“空回复”让用户猜。
+            val reasoningNote = if (stripped.isBlank() && reasoning.isNotBlank()) {
+                "；注意：正文为空、但思考内容非空，可能是思考耗尽了 token 预算，" +
+                    "思考开/自动时 max_tokens 已抬高，仍出现此情况请换回思考关闭再试"
+            } else ""
             val diag = "生成诊断：finish_reason=" + finishReason +
                 "；content 是否为空=" + if (content.isBlank()) "是" else "否" +
                 "；reasoning_content 存在=" + if (reasoning.isBlank()) "否" else "是" +
                 "（长度=" + reasoning.length + " 字）" +
                 "；content 过滤前长度=" + content.length + " 字" +
                 "；过滤 <think> 后长度=" + stripped.length + " 字" +
-                "；tokens：" + usageText +
+                "；tokens：" + usageText + reasoningNote +
                 "；原始 content 前 200 字：" + if (preview.isBlank()) "(空)" else preview
             Pair(stripped, diag)
         } catch (e: Exception) {
@@ -117,24 +126,55 @@ object ApiClient {
         }
     }
 
-    fun maxTokensForStyle(style: String): Int {
-        return if (style == "简短") 80 else 180
+    /** 当前思考模式（SettingsStore.reasoningMode，默认 "off"）。 */
+    fun reasoningMode(context: Context): String {
+        return try {
+            SettingsStore(context).reasoningMode
+        } catch (_: Exception) {
+            "off"
+        }
+    }
+
+    /**
+     * 各风格的 max_tokens（2026-11-02 旧空回复教训的修复）：
+     * - 思考关（off，默认）：自然/幽默 180、简短 80，和上一版一样，快。
+     * - 思考自动/开启（auto/on）：自然/幽默 600、简短 300。
+     *   原因：思考开着时，思考 token 和正文 token 共用同一个预算，
+     *   180 很容易被思考段先耗完、剩下正文为空——这就是 2026-11-02
+     *   上午“本地模型返回了空回复”那次的疑似机制。抬高上限只是
+     *   给正文留出空间，不是保证质量一定更好，速度也会变慢，
+     *   界面文案必须如实写这一点。
+     */
+    fun maxTokensForStyle(style: String, reasoningMode: String = "off"): Int {
+        return if (reasoningMode == "off") {
+            if (style == "简短") 80 else 180
+        } else {
+            if (style == "简短") 300 else 600
+        }
     }
 
     /**
      * 三种风格各自的完整系统提示词前置（2026-11-02 用户批准原样含义，
      * 不要为了省 token 缩短：每条只有约 70 字，相对 1024 上下文可忽略，
-     * 且速度已经很快，用户明确说先不管长短）。
-     * 推理仍关（LocalServer --reasoning off），温度 0.7、
-     * max_tokens 自然/幽默 180、简短 80、上下文 1024 均不变。
+     * 且速度已经很快，用户明确说先不管长短；2026-11-02 后又加了
+     * “不要冒充原帖作者”一句硬约束，见下面 notAuthor）。
+     * 思考模式默认关、可选（LocalServer --reasoning 跟随用户选择），温度 0.7、
+     * max_tokens 思考关时自然/幽默 180、简短 80，思考开/自动时 600/300，
+     * 上下文 1024 均不变。
      */
     fun styleSystemPrompt(style: String): String {
         // 三个前置开头统一：先定身份是推特（X）的回复助手，
         // 再接各自风格要求，避免模型把它当成通用聊天助手。
+        // 2026-11-02 幽默实测教训（真实帖子“叮当猫哭晕在厕所”）：
+        // 模型冒充原帖作者、以“叮当猫：”开头、还编了原帖没有的
+        // “开发哭这个功能”，所以三条前置都要加同一句硬约束：
+        // 你不是原帖作者，你是评论区网友，不要冒充、不要以“某某：”开头、
+        // 不要编造原帖没有的事，只接原帖已有的梗。
+        val notAuthor = "你不是原帖作者，你是评论区网友，不要冒充原帖作者，不要以'某某：'开头，不要编造原帖没有的事，只接原帖已有的梗。"
         return when (style) {
-            "幽默" -> "你是一个推特（X）的回复助手，你是 X 上一个爱开玩笑的网友，用幽默、梗、反差、自嘲回一条，好笑但不冒犯、不低俗。笑点放后面，不要解释笑点，不要说教、不要长篇，一两句就行，只输出回复正文。不要思考过程，不要带标签。"
-            "简短" -> "你是一个推特（X）的回复助手，你是 X 上一个网友，用最短的话回一条，一句话、十几二十个字左右，接梗或者点赞式地回一句。不展开、不建议、不总结、不重复原帖，只输出回复正文。不要思考过程，不要带标签。"
-            else -> "你是一个推特（X）的回复助手，你是 X 上一个普通网友，用口语、自然地回一条，像真人聊天。贴合原帖的语气和梗，接住对方的话，不要重复原帖，不要官方腔、不要说教、不要给建议、不要总结，一两句就行，只输出回复正文。不要思考过程，不要带标签。"
+            "幽默" -> "你是一个推特（X）的回复助手，你是 X 上一个爱开玩笑的网友，用幽默、梗、反差、自嘲回一条，好笑但不冒犯、不低俗。笑点放后面，不要解释笑点，不要说教、不要长篇，一两句就行，只输出回复正文。不要思考过程，不要带标签。" + notAuthor
+            "简短" -> "你是一个推特（X）的回复助手，你是 X 上一个网友，用最短的话回一条，一句话、十几二十个字左右，接梗或者点赞式地回一句。不展开、不建议、不总结、不重复原帖，只输出回复正文。不要思考过程，不要带标签。" + notAuthor
+            else -> "你是一个推特（X）的回复助手，你是 X 上一个普通网友，用口语、自然地回一条，像真人聊天。贴合原帖的语气和梗，接住对方的话，不要重复原帖，不要官方腔、不要说教、不要给建议、不要总结，一两句就行，只输出回复正文。不要思考过程，不要带标签。" + notAuthor
         }
     }
 
@@ -229,16 +269,20 @@ object ApiClient {
         }
     }
 
-    private fun buildBody(style: String, postText: String, stream: Boolean): JSONObject {
+    private fun buildBody(style: String, postText: String, stream: Boolean, modelAlias: String, reasoningMode: String = "off"): JSONObject {
         // 三种风格各用完整前置（styleSystemPrompt），不再拼 V38 短句。
-        // 推理仍关（服务端 --reasoning off），温度 0.7 不变。
+        // 思考模式默认关、可选（服务端 --reasoning 跟随用户选择），温度 0.7 不变。
+        // max_tokens 跟随思考模式：思考开/自动时抬高，防思考耗尽预算出空回复。
+        // model 必须是当前选用模型的 alias（2B 或 4B），不能写死 2B：
+        // llama-server 启动时 --alias 起的名字和这里必须一致，否则
+        // 切换到 4B 后请求还会去找 2B 的名字。
         val system = styleSystemPrompt(style)
         val user = "X 帖子：\n" + postText.take(2000) + "\n回一条，别自动发送。"
         return JSONObject().apply {
-            put("model", LocalConfig.LOCAL_MODEL_NAME)
+            put("model", modelAlias)
             put("stream", stream)
             put("temperature", 0.7)
-            put("max_tokens", maxTokensForStyle(style))
+            put("max_tokens", maxTokensForStyle(style, reasoningMode))
             put("messages", JSONArray().apply {
                 put(JSONObject().apply { put("role", "system"); put("content", system) })
                 put(JSONObject().apply { put("role", "user"); put("content", user) })
@@ -261,7 +305,7 @@ object ApiClient {
                 .addHeader("Authorization", "Bearer local")
                 .addHeader("Content-Type", "application/json")
                 .addHeader("Accept", "text/event-stream")
-                .post(buildBody(style, postText, true).toString().toRequestBody("application/json".toMediaType()))
+                .post(buildBody(style, postText, true, LocalServer.selectedModel(context).alias, reasoningMode(context)).toString().toRequestBody("application/json".toMediaType()))
                 .build()
             val call = client.newCall(req)
             activeCall = call
@@ -275,6 +319,15 @@ object ApiClient {
                         ?: return@withContext Result.failure(Exception("本地模型返回为空"))
                     val filter = ThinkFilter()
                     val sb = StringBuilder()
+                    // 流式 null 防闪烁状态（2026-11-02 实测：先看到 null，
+                    // 生成完最终文本覆盖时又跳一次）：
+                    // sb 累积的是未去 null 的可见文本，emitted 是已经发给
+                    // 面板、且已去 null 的文本；每块只发 cleaned 相对 emitted
+                    // 多出来的部分，所以面板上永远不会出现 null 前缀，
+                    // 最终覆盖时也是同一段文本，不会再跳一次。
+                    // 句中出现的 null 不动，只处理开头。
+                    val emitted = StringBuilder()
+                    var reasoningSeenInStream = false
                     while (true) {
                         val line = try { source.readUtf8Line() } catch (_: Exception) { break } ?: break
                         if (!line.startsWith("data:")) continue
@@ -288,12 +341,30 @@ object ApiClient {
                                 return@withContext Result.failure(Exception(err.optString("message", "本地模型返回错误")))
                             }
                             val delta = json.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")
+                            // 思考模式开/自动时，流里可能有 reasoning_content
+                            // 增量：它绝不能显示，也绝不能被当成正文，只记
+                            // 一个“见过思考”的标记，供最后空回复时诊断用。
+                            val reasoningPiece = delta?.optString("reasoning_content", "") ?: ""
+                            if (reasoningPiece.isNotBlank()) reasoningSeenInStream = true
                             val piece = delta?.optString("content", "") ?: ""
                             if (piece.isNotEmpty()) {
                                 val visible = filter.feed(piece)
                                 if (visible.isNotEmpty()) {
                                     sb.append(visible)
-                                    onDelta(visible)
+                                    val raw = sb.toString()
+                                    // 分块可能把 "null" 切开（"nu"+"ll…"）：
+                                    // 累积文本还是 "null" 的前缀时先一字不发，
+                                    // 等下一块来了再判断，避免先闪 "nu" 再跳变。
+                                    val isNullPrefix = raw.length in 1..4 &&
+                                        "null".startsWith(raw.lowercase())
+                                    if (!isNullPrefix) {
+                                        val cleaned = stripLeadingNull(raw)
+                                        if (cleaned.length > emitted.length) {
+                                            onDelta(cleaned.substring(emitted.length))
+                                            emitted.clear()
+                                            emitted.append(cleaned)
+                                        }
+                                    }
                                 }
                             }
                         } catch (_: Exception) {
@@ -301,11 +372,26 @@ object ApiClient {
                         }
                     }
                     sb.append(filter.flush())
-                    // 流式最终文本也要去掉开头 "null" 前缀，再做空判断；
-                    // 面板最终会用这段结果覆盖流式中逐字显示的文本。
+                    // 最终文本同样先去开头 null 再做空判断；如果流里
+                    // 已发出的 emitted 和最终文本一致，面板覆盖时
+                    // 就是同一段文本，不会再跳一次。
                     val text = stripLeadingNull(sb.toString().trim())
-                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复"))
-                    else Result.success(text)
+                    if (text.length > emitted.length) {
+                        onDelta(text.substring(emitted.length))
+                    }
+                    if (text.isBlank()) {
+                        if (reasoningSeenInStream) {
+                            Result.failure(
+                                Exception(
+                                    "本地模型返回了空回复（流里只收到了思考内容，没有正文；" +
+                                        "思考开/自动时可能思考耗尽了 token 预算，" +
+                                        "请换回思考关闭再试，或检查思考模式与 max_tokens）"
+                                )
+                            )
+                        } else {
+                            Result.failure(Exception("本地模型返回了空回复"))
+                        }
+                    } else Result.success(text)
                 }
             } finally {
                 if (activeCall == call) activeCall = null
@@ -329,7 +415,7 @@ object ApiClient {
                 .url("${LocalConfig.LOCAL_BASE_URL}/v1/chat/completions")
                 .addHeader("Authorization", "Bearer local")
                 .addHeader("Content-Type", "application/json")
-                .post(buildBody(style, postText, false).toString().toRequestBody("application/json".toMediaType()))
+                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, reasoningMode(context)).toString().toRequestBody("application/json".toMediaType()))
                 .build()
             val call = client.newCall(req)
             activeCall = call
