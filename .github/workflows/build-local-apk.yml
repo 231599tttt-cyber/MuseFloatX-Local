@@ -81,6 +81,16 @@ jobs:
           echo "llama-server binary: $BIN"
           test -n "$BIN"
           ls -lh "$BIN"
+          # Strip debug symbols: the static binary is ~194MB unstripped, which
+          # would make the APK huge for no benefit. Stripping is safe for an
+          # executable and does not change its DT_NEEDED entries.
+          STRIP_BIN="$(find "$NDK_HOME" -name "llvm-strip" -type f 2>/dev/null | head -1)"
+          if [ -n "$STRIP_BIN" ]; then
+            "$STRIP_BIN" "$BIN" || echo "WARNING: llvm-strip failed, keeping unstripped binary"
+            ls -lh "$BIN"
+          else
+            echo "WARNING: llvm-strip not found in NDK, keeping unstripped binary"
+          fi
           echo "=== DT_NEEDED of llama-server ==="
           READELF="$(command -v llvm-readelf || command -v readelf)"
           "$READELF" -d "$BIN" | tee /tmp/dt_needed.txt || true
@@ -97,6 +107,23 @@ jobs:
           find /tmp/llama.cpp/build-android -name "*.so" -type f | while read -r SO; do
             cp "$SO" app/src/main/jniLibs/arm64-v8a/
           done
+          # libomp.so is the exception that the step above cannot find: the
+          # static llama-server still links the OpenMP runtime, and that
+          # runtime lives in the NDK toolchain, not in the llama.cpp build
+          # dir, and NOT in the Android system image. Without bundling it,
+          # the phone would fail at startup with a missing-library error,
+          # and the DT_NEEDED check below correctly fails the build.
+          LIBOMP="$(find "$NDK_HOME" -name "libomp.so" -path "*aarch64*" 2>/dev/null | head -1)"
+          if [ -z "$LIBOMP" ]; then
+            LIBOMP="$(find "$NDK_HOME" -name "libomp.so" 2>/dev/null | head -1)"
+          fi
+          if [ -n "$LIBOMP" ]; then
+            cp "$LIBOMP" app/src/main/jniLibs/arm64-v8a/
+            echo "bundled libomp: $LIBOMP"
+            ls -lh app/src/main/jniLibs/arm64-v8a/libomp.so
+          else
+            echo "WARNING: libomp.so not found anywhere in NDK, DT_NEEDED check below will fail if it is needed"
+          fi
           # Every non-system DT_NEEDED entry must have a matching .so in jniLibs.
           # System libs provided by Android itself: libc, libm, libdl, liblog,
           # libandroid, libz. Anything else missing here = build failure, not a
