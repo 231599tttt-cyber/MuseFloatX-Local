@@ -144,7 +144,10 @@ object ApiClient {
     /** 当前思考模式（SettingsStore.reasoningMode，默认 "off"）。 */
     fun reasoningMode(context: Context): String {
         return try {
-            SettingsStore(context).reasoningMode
+            // 天生非思考模型强制 off（与 LocalServer.reasoningMode 同规则，
+            // 否则 max_tokens 会按思考档抬到 600/300，白白变慢）。
+            if (SettingsStore(context).selectedModel.isNonThinking) "off"
+            else SettingsStore(context).reasoningMode
         } catch (_: Exception) {
             "off"
         }

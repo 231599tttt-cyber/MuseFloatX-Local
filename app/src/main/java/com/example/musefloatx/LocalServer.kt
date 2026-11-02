@@ -93,7 +93,12 @@ object LocalServer {
      */
     fun reasoningMode(context: Context): String {
         return try {
-            SettingsStore(context).reasoningMode
+            // 天生非思考模型（如 2B 槽位现为 Qwen3-4B-Instruct-2507）：
+            // 官方只支持非思考模式，强制 off，不管用户之前选过什么，
+            // 否则会把一个不需要思考的模型硬塞进思考路径。
+            // 旧 4B 卡片不受影响，仍按用户选择走。
+            if (selectedModel(context).isNonThinking) "off"
+            else SettingsStore(context).reasoningMode
         } catch (_: Exception) {
             "off"
         }

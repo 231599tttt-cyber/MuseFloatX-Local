@@ -1,10 +1,17 @@
 package com.example.musefloatx
 
 /**
- * 模型定义：2B 和 4B 各是一个 LocalModel，互不覆盖。
+ * 模型定义：2B 槽位和 4B 各是一个 LocalModel，互不覆盖。
  *
- * 2B（已有，不改）：落盘 Qwen3.5-2B-Q4_K_M.gguf，官方 URL 不变，
- * 下面旧常量 MODEL_* 全部仍是 2B 的值，老代码继续能用。
+ * 2B 槽位（2026-11-02 用户纠正后替换，不再是 Qwen3.5-2B）：
+ * 换成 Qwen3-4B-Instruct-2507 Q4_K_M，落盘
+ * Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf，官方 URL，约 2.50GB。
+ * 槽位 id 仍叫 "2B"（老用户偏好里存的就是它，回落逻辑不变），
+ * 但显示名、仓库、文件名、大小、SHA、alias 全部是新模型的；
+ * 旧 Qwen3.5-2B 文件名不同，不会被新模型误认，已下载状态
+ * 会显示未下载，需要重新下载约 2.50GB，旧文件不会被自动删。
+ * 下面旧常量 MODEL_* 全部改为新模型的值，老代码继续能用。
+ * 4B 卡片（旧 Qwen3.5-4B）原样保留，不动。
  *
  * 4B（新增，2026-11-02 从 Hugging Face 官方 API 核实，非猜测）：
  * - 仓库 bartowski/Qwen_Qwen3.5-4B-GGUF，原模型 Qwen/Qwen3.5-4B，
@@ -43,70 +50,76 @@ data class LocalModel(
     /** llama-server 启动时的 --alias，也是 ApiClient 请求里的 model 名。 */
     val alias: String,
     /** 界面显示的大小文案，如 "约 1.40GB"。 */
-    val approxSizeLabel: String
+    val approxSizeLabel: String,
+    /** 是否天生非思考模型：true 时强制 --reasoning off，界面禁用思考开关。 */
+    val isNonThinking: Boolean = false
 )
 
 /**
- * 本地模型配置（Qwen3.5-2B，本地版唯一模型）。
+ * 本地模型配置（2B 槽位，2026-11-02 已替换为 Qwen3-4B-Instruct-2507）。
  *
- * 重要纠正（用户 2026-11-02 明确指出，不要再按旧说法改）：
- * - Qwen3.5-2B 本身就是后训练对话版本，不要误认为必须带 Instruct 后缀，
- *   也不要下载 Qwen3.5-2B-Base。正确来源就是 bartowski/Qwen_Qwen3.5-2B-GGUF，
- *   原模型 Qwen/Qwen3.5-2B。
- * - 文件名注意：Hugging Face 文件列表里显示为 Qwen3.5-2B-Q4_K_M.gguf，
- *   但 resolve 下载的实际文件名带 Qwen_ 前缀（Qwen_Qwen3.5-2B-Q4_K_M.gguf），
- *   直接用不带前缀的名字下载会 404（已实测）。代码里下载用带前缀的 URL，
- *   落盘保存时用不带前缀的干净名字，方便以后在 App 里找。
- * - 官方说明：2B 默认就是非思考模式。主办法是让 llama-server 使用模型
- *   自带的聊天模板（不要自己覆盖一个会触发思考的模板），不要靠事后过滤。
- *   事后过滤 <think> 只是兜底，见 ApiClient.ThinkFilter。
- * - 上下文先按 1024 tokens 做第一版测试，不要写死 512。
+ * 替换原因（用户纠正）：不要替换 4B 卡片，替换 2B 卡片。
+ * 旧 Qwen3.5-2B 质量差、回得说教还编东西，新模型是质量优先、
+ * 4B 档的主推：Qwen3-4B-Instruct-2507。
+ * - 原模型 Qwen/Qwen3-4B-Instruct-2507，仓库
+ *   bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF，量化 Q4_K_M。
+ * - 它天生就是非思考模型（官方 Instruct-2507 只支持非思考模式，
+ *   不生成 think 内容），所以强制 --reasoning off，界面对它
+ *   禁用思考开关；不要给它开思考，那是画蛇添足。
+ * - 文件名注意：HF 文件表里的实际文件名就是带 Qwen_ 前缀的
+ *   Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf（之前研究里提到的
+ *   “文件表 vs CLI 示例前缀不一致”已核对：以文件表为准，
+ *   下载和落盘都用这个全名，不要再 strip 前缀）。
+ * - 大小与 SHA（2026-11-02 从 HF 树状 API 核实，非猜测）：
+ *   size = 2,497,280,736 字节，约 2.50GB；LFS oid（即 SHA256）=
+ *   2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e。
+ * - 上下文先按 1024 tokens 测试，不要写死 512。
  *   这里的 1024 只是默认值，用户可以在主界面改（SettingsStore.contextTokens），
  *   LocalServer 启动时读那个值，改完下次加载生效。
  */
 object LocalConfig {
     /** 模型仓库（Hugging Face）。 */
-    const val MODEL_REPO = "bartowski/Qwen_Qwen3.5-2B-GGUF"
+    const val MODEL_REPO = "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF"
     /** 原模型。 */
-    const val MODEL_ORIGINAL = "Qwen/Qwen3.5-2B"
+    const val MODEL_ORIGINAL = "Qwen/Qwen3-4B-Instruct-2507"
     /**
-     * 下载 URL（带 Qwen_ 前缀的实际文件名，否则 404）。
-     * 用户 2026-11-02 决定：直接用官方地址，不用镜像。
+     * 下载 URL（文件表里的全名，否则 404）。
      * 注意：国内直连 huggingface.co 可能 30 秒连接超时，
      * 此时需开能上外网的 VPN 再点下载，已下载的部分可续传。
      */
     const val MODEL_DOWNLOAD_URL =
-        "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_K_M.gguf"
-    /** 落盘文件名。 */
-    const val MODEL_FILE_NAME = "Qwen3.5-2B-Q4_K_M.gguf"
+        "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+    /** 落盘文件名（与下载文件名一致的全名）。 */
+    const val MODEL_FILE_NAME = "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
     /** 量化。 */
     const val MODEL_QUANT = "Q4_K_M"
-    /** 约 1.40 GB（十进制），即 curl 实测的 1,396,198,496 字节。 */
-    const val MODEL_EXPECTED_BYTES = 1396198496L
+    /** 约 2.50 GB（十进制），即 HF 树状 API 的 2,497,280,736 字节。 */
+    const val MODEL_EXPECTED_BYTES = 2497280736L
     /**
-     * Hugging Face 文件页上公布的 SHA256（Qwen3.5-2B-Q4_K_M.gguf，1.4 GB）。
+     * Hugging Face 树状 API 公布的 LFS oid，即文件内容 SHA256。
      * 下载完成后校验用；如果 Hugging Face 重新上传导致 SHA 变化，
      * 请同步更新这里，否则下载会一直报 SHA 不一致。
      */
-    const val MODEL_SHA256 = "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8"
+    const val MODEL_SHA256 = "2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e"
 
     /** 本地 llama-server 监听地址（只绑回环，不暴露到局域网）。 */
     const val LOCAL_BASE_URL = "http://127.0.0.1:8080"
     const val LOCAL_PORT = 8080
     /** llama-server 里给这个模型起的别名，ApiClient 请求时 model 就填它。 */
-    const val LOCAL_MODEL_NAME = "Qwen3.5-2B"
+    const val LOCAL_MODEL_NAME = "Qwen3-4B-Instruct-2507"
 
-    /** 2B 模型规格（和上面旧常量一一对应，老代码不用改）。 */
+    /** 2B 槽位模型规格（现为 Qwen3-4B-Instruct-2507，和上面旧常量一一对应）。 */
     val MODEL_2B = LocalModel(
         id = "2B",
-        displayName = "Qwen3.5-2B Q4_K_M",
+        displayName = "Qwen3-4B-Instruct-2507 Q4_K_M",
         repo = MODEL_REPO,
         downloadUrl = MODEL_DOWNLOAD_URL,
         fileName = MODEL_FILE_NAME,
         expectedBytes = MODEL_EXPECTED_BYTES,
         sha256 = MODEL_SHA256,
         alias = LOCAL_MODEL_NAME,
-        approxSizeLabel = "约 1.40GB"
+        approxSizeLabel = "约 2.50GB",
+        isNonThinking = true
     )
 
     /** 4B 模型规格（2026-11-02 从 HF 官方 API 核实，见文件头注释）。 */

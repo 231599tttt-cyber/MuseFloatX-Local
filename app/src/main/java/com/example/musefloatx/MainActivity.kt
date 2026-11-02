@@ -126,6 +126,9 @@ class MainActivity : ComponentActivity() {
                 val unusedTick = tick
                 /** 当前选用模型 id（界面状态，和 SettingsStore.selectedModelId 同步）。 */
                 var selectedModelId by remember { mutableStateOf(store.selectedModelId) }
+                /** 当前选用模型规格；天生非思考模型时思考开关要禁用（见 4a）。 */
+                val selectedModelSpec = LocalConfig.modelForId(selectedModelId)
+                val isNonThinkingModel = selectedModelSpec.isNonThinking
                 /**
                  * 按钮反馈核心状态：
                  * - busyButton：当前正在干活的按钮 key（如“删除模型”），
@@ -363,7 +366,8 @@ class MainActivity : ComponentActivity() {
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            "来源：${model.repo}（原模型 ${if (model.id == "4B") "Qwen/Qwen3.5-4B" else "Qwen/Qwen3.5-2B"}，本身就是后训练对话版本，不是 Base 版），文件 ${model.fileName}，${model.approxSizeLabel}。首次下载一次，之后完全离线。",
+                            "来源：${model.repo}（原模型 ${if (model.id == "4B") "Qwen/Qwen3.5-4B" else "Qwen/Qwen3-4B-Instruct-2507"}，本身就是后训练对话版本，不是 Base 版），文件 ${model.fileName}，${model.approxSizeLabel}。首次下载一次，之后完全离线。" +
+                                if (model.isNonThinking) "这个模型天生就是非思考模型，思考开关对它不起作用，已固定关闭。" else "",
                             fontSize = 13.sp
                         )
                         Text(modelStatusText(model), fontSize = 13.sp)
@@ -502,6 +506,13 @@ class MainActivity : ComponentActivity() {
                         "关闭（快）：和现在一样，生成非常快，2B 直答容易套话。自动：让模型模板自己决定是否思考。开启（慢但可能更准）：强制思考，第一次生成会明显变慢，质量不保证一定更好，只是给你一个可以自己试的开关。思考开/自动时，max_tokens 会自动抬高（自然/幽默 600、简短 300），防止思考把 token 预算耗完、正文变空；思考关时还是 180/80。改动后会先停掉正在跑的服务，下次启动/生成时按新模式重起，只改选项、不重启是不会生效的。",
                         fontSize = 13.sp
                     )
+                    if (isNonThinkingModel) {
+                        Text(
+                            "当前选用的是 ${selectedModelSpec.displayName}，它本身就是非思考模型，思考开关对它不起作用，已固定关闭，不用再切自动/开启。切回旧 4B 卡片才能再用思考开关。",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                     Row {
                         listOf(
                             "off" to "关闭（快）",
@@ -520,7 +531,7 @@ class MainActivity : ComponentActivity() {
                                         actionMessage = "思考模式已经是$label，不用重复切换"
                                         toastShort(actionMessage)
                                     },
-                                    enabled = busyButton == null,
+                                    enabled = busyButton == null && !isNonThinkingModel,
                                     modifier = Modifier.padding(end = 8.dp)
                                 ) { Text(label) }
                             } else {
@@ -588,7 +599,8 @@ class MainActivity : ComponentActivity() {
                                     // 只有思考“关闭”在测试进行中也可点（上面那条
                                     // 取消 + 切回关闭的路）；其他思考按钮在忙时仍禁用，
                                     // 避免在测试中途又去切自动/开启、把状态搅乱。
-                                    enabled = busyButton == null || (mode == "off" && busyButton == "测试本地生成"),
+                                    // 天生非思考模型时全部禁用（上面已写明固定关闭）。
+                                    enabled = !isNonThinkingModel && (busyButton == null || (mode == "off" && busyButton == "测试本地生成")),
                                     modifier = Modifier.padding(end = 8.dp)
                                 ) { Text(buttonText) }
                             }
