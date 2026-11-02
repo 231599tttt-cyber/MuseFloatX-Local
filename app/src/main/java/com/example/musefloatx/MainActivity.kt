@@ -80,6 +80,7 @@ class MainActivity : ComponentActivity() {
                 var status by remember { mutableStateOf(modelStatusText()) }
                 var downloadProgress by remember { mutableStateOf("") }
                 var testResult by remember { mutableStateOf("") }
+                var diagnostic by remember { mutableStateOf("") }
                 var showWifiDialog by remember { mutableStateOf(false) }
                 var tick by remember { mutableStateOf(0) }
                 @Suppress("UNUSED_VARIABLE")
@@ -198,6 +199,26 @@ class MainActivity : ComponentActivity() {
                         }
                     }) { Text("测试本地生成") }
                     if (testResult.isNotBlank()) Text(testResult, fontSize = 13.sp)
+                    Spacer(Modifier.height(16.dp))
+
+                    Text("4b. 本地服务启动诊断（启动失败时看这里）", fontWeight = FontWeight.Bold)
+                    Text("如果测试失败或点球后没反应，不要只说“失败”：点下面按钮，这里会显示真实报错原文（比如 Permission denied、找不到某个 .so、进程提前退出、加载超时）和进程日志尾部。把这段全文截图或发回来，才能定位是权限问题、缺库问题还是内存不够。", fontSize = 13.sp)
+                    Row {
+                        Button(
+                            onClick = {
+                                diagnostic = "正在尝试启动本地服务并收集诊断…"
+                                scope.launch {
+                                    val ok = LocalServer.ensureStartedForTest(this@MainActivity, store.contextTokens)
+                                    diagnostic = "启动结果：" + if (ok) "成功" else "失败" + "\n" + LocalServer.diagnosticInfo(this@MainActivity)
+                                }
+                            },
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) { Text("检查本地服务启动") }
+                        OutlinedButton(onClick = {
+                            diagnostic = LocalServer.diagnosticInfo(this@MainActivity)
+                        }) { Text("只看当前诊断（不启动）") }
+                    }
+                    if (diagnostic.isNotBlank()) Text(diagnostic, fontSize = 12.sp)
                     Spacer(Modifier.height(16.dp))
 
                     Text("5. 悬浮球", fontWeight = FontWeight.Bold)

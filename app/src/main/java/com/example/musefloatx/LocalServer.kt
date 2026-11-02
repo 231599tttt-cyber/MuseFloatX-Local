@@ -9,9 +9,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -23,27 +21,44 @@ import java.net.URL
  * - 悬浮球关闭时卸载：FloatingService.onDestroy / STOP 里调 stop()。
  * - 10 分钟无生成自动卸载：每次生成结束调 markUsed()，之后 10 分钟
  *   没有新生成就自动 stop()，释放内存；下次点球再重新加载。
- * - mmap 加载：llama-server 默认就是 mmap，启动参数里显式传 --mmap，
- *   让系统可以在内存紧张时回收模型页，而不是一直钉死 1.6GB。
+ * - mmap 加载：启动参数里显式传 --mmap，让系统可以在内存紧张时
+ *   回收模型页，而不是一直钉死 1.6GB。
  *
  * 聊天模板（用户纠正的第 2 点）：
  * - 不传 --chat-template、不用自定义模板，让 llama-server 直接用模型
  *   自带的聊天模板。Qwen3.5-2B 官方默认就是非思考模式，模板本身
- *   会处理好（模板里 assistant 开头是空的思考段，模型接着直接输出正文），
- *   不要自己写一个会触发思考的模板。事后过滤 <think> 只在 ApiClient 里作兜底。
+ *   会处理好，不要自己写一个会触发思考的模板。事后过滤 <think>
+ *   只在 ApiClient 里作兜底。
  *
- * 打包方式：
- * - GitHub Actions 里用 CMake + Android NDK 编 llama-server（arm64-v8a），
- *   必须用 -DBUILD_SHARED_LIBS=OFF 静态编译，产物放在 app/src/main/assets/llama-server，APK 里带上。
- *   默认的动态编译只会产出一个约 7KB 的 stub，运行时要找 libllama.so / libggml.so，
- *   那些 .so 不在 APK 里，手机上一定起不来——工作流里已加检查，抓到这种 stub 就直接失败，
- *   不会把它打进 APK 蒙混过去。
- * - 首次使用时把 assets 里的 llama-server 复制到 filesDir/bin/llama-server
- *   并 chmod +x，然后 ProcessBuilder 启动它。assets 里的文件不能直接执行，
- *   必须先复制出来，这一步是必须的，不是可选项。
- * - 如果 assets 里没有 llama-server（例如本地只编了 APK、没编 native），
- *   ensureStarted() 会直接报错，绝不静默回退到任何远程服务——
- *   本地版没有远程服务可回退。
+ * 打包与启动方式（2026-11-02 修复，针对 targetSdk 34 / Android 10+ W^X 限制）：
+ * - 旧方式（已废弃，不要再用）：把程序复制到应用私有目录再执行。
+ *   Android 10 及以上对应用私有目录有 W^X 限制，那个目录里的文件
+ *   即使 chmod +x 也很可能报 Permission denied，GitHub 编译成功
+ *   不等于真机能跑。所以旧方式已彻底删掉，本文件里不再出现它。
+ * - 新方式（过渡方案，见 README 的 JNI 评估）：llama-server 以原生库
+ *   形式打包，文件在 APK 的 lib/arm64-v8a/libllama_server.so，
+ *   安装时系统把它解压到应用的 nativeLibraryDir，那个目录是可执行的。
+ *   启动时直接执行 nativeLibraryDir 里的这个文件，并把
+ *   LD_LIBRARY_PATH 设成 nativeLibraryDir，这样它要找的动态库
+ *   （如果有的话）也能在同一个目录里找到。
+ * - 打包要求（工作流里强制检查，任一项不过就构建失败）：
+ *   1) APK 里必须有 lib/arm64-v8a/libllama_server.so；
+ *   2) 它不能是约 7KB 的动态 stub，必须是大于 1MB 的完整程序
+ *      （静态编译，或动态编译但所有依赖 .so 都一起打进了 jniLibs）；
+ *   3) 用 readelf -d 查它的 DT_NEEDED，凡是不是系统库
+ *      （libc / libm / libdl / liblog / libandroid）的依赖，
+ *      都必须在同一个 jniLibs 目录里有对应的 .so，否则构建失败；
+ *   4) 本文件里不再出现旧的私有目录执行路径。
+ * - 最终合规方案是 JNI 直接加载（见 README），不是一直用进程执行
+ *   .so。本文件只是过渡方案，跑通真机测试后再做 JNI。
+ *
+ * 启动失败诊断：
+ * - 绝不静默失败：进程提前退出、超时、找不到文件、Permission denied
+ *   都会把真实原因写进 lastError，并把进程日志尾部一起带上。
+ * - 主界面有“检查本地服务启动”按钮，直接显示 diagnosticInfo()，
+ *   用户把那段原文发回来就能定位，不要只报“失败”两个字。
+ * - 本地版没有远程服务可回退，启动失败就是启动失败，不会偷偷
+ *   连到别的服务器。
  */
 object LocalServer {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -66,25 +81,45 @@ object LocalServer {
             f.length() < LocalConfig.MODEL_EXPECTED_BYTES * 101 / 100
     }
 
-    private fun serverBinary(context: Context): File {
-        return File(File(context.filesDir, "bin"), "llama-server")
+    /** 原生库目录里的推理程序：APK 安装时从 lib/arm64-v8a/ 解压到这里。 */
+    fun serverBinary(context: Context): File {
+        return File(context.applicationInfo.nativeLibraryDir, "libllama_server.so")
     }
 
-    /** 把 assets 里的 llama-server 复制到可执行位置，返回 true 表示可用。 */
-    private fun installBinary(context: Context): Boolean {
+    private fun serverLogFile(context: Context): File {
+        return File(context.cacheDir, "llama-server.log")
+    }
+
+    /** 进程日志尾部（最多约 1500 字），启动失败时用来看真实原因。 */
+    fun serverLogTail(context: Context): String {
         return try {
-            val out = serverBinary(context)
-            if (out.exists() && out.canExecute() && out.length() > 0) return true
-            out.parentFile?.mkdirs()
-            context.assets.open("llama-server").use { input ->
-                FileOutputStream(out).use { output -> input.copyTo(output) }
-            }
-            out.setExecutable(true)
-            out.exists() && out.canExecute()
+            val f = serverLogFile(context)
+            if (!f.exists()) return "（暂无进程日志文件）"
+            val text = f.readText()
+            if (text.isBlank()) "（进程日志为空）" else text.takeLast(1500)
         } catch (e: Exception) {
-            lastError = "安装本地推理程序失败：${e.message}"
-            false
+            "（读进程日志失败：${e.message}）"
         }
+    }
+
+    /** 主界面诊断用：原生库路径、文件大小、进程状态、最后一次真实报错、日志尾部。 */
+    fun diagnosticInfo(context: Context): String {
+        val bin = serverBinary(context)
+        val sb = StringBuilder()
+        sb.append("原生库目录：").append(context.applicationInfo.nativeLibraryDir).append("\n")
+        sb.append("推理程序：").append(bin.absolutePath).append("\n")
+        sb.append("文件存在：").append(if (bin.exists()) "是" else "否").append("\n")
+        if (bin.exists()) {
+            sb.append("文件大小：").append(bin.length() / 1024 / 1024).append("MB")
+            if (bin.length() < 1024 * 1024) sb.append("（小于 1MB，很可能是没带依赖的 stub，请重装修复后的 APK）")
+            sb.append("\n")
+            sb.append("可执行标记：").append(if (bin.canExecute()) "是" else "否（系统解压时一般自带可执行权限，否也不一定就是失败原因，看下面报错原文）").append("\n")
+        }
+        sb.append("模型已下载：").append(if (isModelDownloaded(context)) "是" else "否").append("\n")
+        sb.append("服务在跑：").append(if (isRunning && process?.isAlive == true) "是" else "否").append("\n")
+        sb.append("最后一次报错：").append(lastError ?: "（无）").append("\n")
+        sb.append("进程日志尾部：\n").append(serverLogTail(context))
+        return sb.toString()
     }
 
     /** 悬浮球启动时调：模型没下好直接报错，不启动空服务。 */
@@ -97,11 +132,24 @@ object LocalServer {
             lastError = "模型还没下载好，请先回主界面下载模型（约 1.40GB）"
             return false
         }
-        if (!installBinary(context)) return false
+        val bin = serverBinary(context)
+        if (!bin.exists()) {
+            lastError = "找不到原生推理程序：${bin.absolutePath} 不存在。APK 里应该有 lib/arm64-v8a/libllama_server.so，请确认装的是修复后的新版 APK，而不是旧版（旧版用的是已被废弃的启动方式）"
+            return false
+        }
+        if (bin.length() < 1024 * 1024) {
+            lastError = "原生推理程序只有 ${bin.length()} 字节，是没带依赖的 stub，不是完整程序。请删除旧 APK，重新下载修复后的 APK 再装"
+            return false
+        }
         return try {
+            // 原生库目录里的文件一般自带可执行权限；这里再尝试一次，失败也不直接
+            // 判死刑，真正的结果看进程能不能起来、报错原文是什么。
+            try { bin.setExecutable(true) } catch (_: Exception) {}
+            val logFile = serverLogFile(context)
+            try { if (logFile.exists()) logFile.delete() } catch (_: Exception) {}
             val ctx = contextTokens.coerceIn(512, 4096)
             val args = listOf(
-                serverBinary(context).absolutePath,
+                bin.absolutePath,
                 "-m", modelFile(context).absolutePath,
                 "--alias", LocalConfig.LOCAL_MODEL_NAME,
                 "--host", "127.0.0.1",
@@ -114,20 +162,36 @@ object LocalServer {
                 // 注意：故意不传 --chat-template，让模型自带模板决定非思考模式。
                 // 也故意不传 --api-key：只绑 127.0.0.1 回环，外面连不进来。
             )
-            process = ProcessBuilder(args)
-                .redirectErrorStream(true)
-                .start()
-            // 等 /health 变 200，最长 180 秒；进程提前死了就直接报。
+            val pb = ProcessBuilder(args)
+            pb.redirectOutput(logFile)
+            pb.redirectErrorStream(true)
+            // 动态库查找路径指向原生库目录：动态编译时依赖的 .so 都打在同一个目录里。
+            val env = pb.environment()
+            val nativeDir = context.applicationInfo.nativeLibraryDir
+            val oldLd = env["LD_LIBRARY_PATH"]
+            env["LD_LIBRARY_PATH"] = if (oldLd.isNullOrBlank()) nativeDir else "$nativeDir:$oldLd"
+            process = pb.start()
+            // 等 /health 变 200，最长 180 秒；进程提前死了就直接报真实原因。
             val deadline = System.currentTimeMillis() + LocalConfig.SERVER_START_TIMEOUT_MS
             var ok = false
+            var exitCode: Int? = null
             while (System.currentTimeMillis() < deadline) {
-                if (process?.isAlive != true) break
+                val p = process
+                if (p == null || !p.isAlive) {
+                    try { exitCode = p?.exitValue() } catch (_: Exception) {}
+                    break
+                }
                 if (isHealthy()) { ok = true; break }
                 delay(500)
             }
             isRunning = ok
             if (!ok) {
-                lastError = "本地模型加载超时或启动失败：请确认手机剩余内存足够（6GB 机器请先关掉大游戏），再点一次悬浮球"
+                val tail = serverLogTail(context)
+                lastError = if (exitCode != null) {
+                    "本地模型进程提前退出（exitCode=$exitCode）。真实原因见进程日志尾部：$tail。如果日志里有 Permission denied，说明原生库执行权限有问题；如果日志里有找不到某个 .so，说明 APK 里缺依赖库。请把主界面诊断全文发回来。"
+                } else {
+                    "本地模型加载超时（180 秒没等到 /health）。请确认手机剩余内存足够（6GB 机器请先关掉大游戏），再点一次悬浮球。进程日志尾部：$tail"
+                }
                 try { process?.destroyForcibly() } catch (_: Exception) {}
                 process = null
             } else {
@@ -135,7 +199,11 @@ object LocalServer {
             }
             ok
         } catch (e: Exception) {
-            lastError = "本地模型启动失败：${e.message}"
+            // 这里就是用户要看的真实报错原文：不要只写“启动失败”，要带异常类型和原文。
+            lastError = "本地模型启动失败：${e.javaClass.simpleName}: ${e.message}。原生库路径：${bin.absolutePath}。如果原文是 Permission denied，说明系统不允许执行这个文件，请把主界面诊断全文发回来。"
+            try { process?.destroyForcibly() } catch (_: Exception) {}
+            process = null
+            isRunning = false
             false
         }
     }
@@ -185,12 +253,12 @@ object LocalServer {
         isRunning = false
     }
 
-    /** 供 MainActivity 测试用：不经过 FloatingService 也能起服务，测完同样会闲置卸载。 */
+    /** 供 MainActivity 测试/诊断用：不经过 FloatingService 也能起服务，测完同样会闲置卸载。 */
     suspend fun ensureStartedForTest(context: Context, contextTokens: Int): Boolean {
         return ensureStarted(context, contextTokens)
     }
 
-    /** 给 ApiClient 用：生成前确保服务在跑，否则返回失败原因。 */
+    /** 给 ApiClient 用：生成前确保服务在跑，否则返回失败原因（带真实报错原文）。 */
     suspend fun ensureStartedForGenerate(context: Context, contextTokens: Int): String? {
         val ok = ensureStarted(context, contextTokens)
         return if (ok) null else (lastError ?: "本地模型未启动")

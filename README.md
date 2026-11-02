@@ -46,17 +46,53 @@
 - 生成：流式出字，首字先出来，不用等全文；温度 0.7，简短 80 tokens、自然/幽默 180 tokens（和第 38 版一样）；
 - 目标：第一次加载一次，之后每条回复几秒出完（真机实测为准，6GB 手机尤其要测）。
 
+## 打包与启动（2026-11-02 修复：旧方式已废弃）
+
+**旧方式为什么不行：** 以前是把 llama-server 从 assets 复制到应用私有目录再执行。项目 targetSdk 34，Android 10 及以上对应用私有目录有 W^X 限制，那个目录里的文件即使 chmod +x 也很可能直接报 Permission denied。GitHub 编译成功不等于真机能跑，所以旧方式已彻底删掉，代码里不再出现它。
+
+**现在的方式（过渡方案，不是最终合规方案）：** llama-server 以原生库形式打包，放在 `app/src/main/jniLibs/arm64-v8a/libllama_server.so`，APK 里对应 `lib/arm64-v8a/libllama_server.so`，安装时系统把它解压到应用的 nativeLibraryDir，那个目录是可执行的。启动时 App 直接执行 nativeLibraryDir 里的这个文件，并把 `LD_LIBRARY_PATH` 设成 nativeLibraryDir，这样动态依赖也能在同一个目录里找到。**注意：Manifest 里必须显式写 `android:extractNativeLibs="true"`，否则系统可能不解压 .so、只从 APK 里直接加载，原生库目录里就没有可执行文件，这条过渡路线就直接断了，不要删掉这一行。**
+
+工作流里强制检查，任一项不过就构建失败，不会放一个坏 APK 蒙混过去：
+
+1. APK 里必须有 `lib/arm64-v8a/libllama_server.so`；
+2. 它不能是约 7KB 的动态 stub，必须大于 1MB（静态编译，或动态编译但所有依赖 .so 都一起打进了 jniLibs）；
+3. 用 readelf -d 查它的 DT_NEEDED：凡是不是系统库（libc / libm / libdl / liblog / libandroid / libz）的依赖，都必须在同一个 jniLibs 目录里有对应的 .so，否则构建失败；
+4. 代码里不再出现旧的私有目录执行路径，否则构建失败。
+
+## JNI 直接加载：最终方案评估（本次先用 .so 执行过渡）
+
+长期更合规的方案是 JNI 直接加载，完全不走进程执行：
+
+- 做法：把 llama.cpp 编成 `libllama.so`，App 用 `System.loadLibrary` 加载，通过 JNI 调模型加载、token 化、采样、生成、聊天模板，不走 8080 端口、不走 HTTP、不起子进程；
+- 好处：没有 W^X 执行权限问题，没有进程生命周期问题，内存由 App 直接控制，卸载就是释放 context / 释放模型，不用杀进程；也不用担心系统杀后台进程后服务悄悄没了；
+- 工作量评估：不是改两行就能成的。需要写一套 C++ 封装（模型加载、context 管理、流式出字回调、错误上报、线程安全），加 Kotlin 侧的 JNI 绑定和加载/卸载状态机，改 CMake 外部原生构建配置，再在多台真机上测内存和崩溃。估计是几天量级的工作，不是半小时能收尾的；
+- 结论：**本次先用 .so 执行方式修复，尽快拿到真机可测的 APK；等真机上确认模型加载、生成速度、幽默质量都没问题后，再把 JNI 作为下一版来做。不要把 .so 执行说成最终合规方案，它只是过渡。**
+
 ## 编译
 
 GitHub Actions 工作流 `.github/workflows/build-local-apk.yml`：
 
-1. 用 CMake + Android NDK r27c 编 llama-server（arm64-v8a，最新 llama.cpp master，支持 Qwen3.5 的 Gated DeltaNet）；
-2. 把 llama-server 放进 `app/src/main/assets/llama-server`，APK 里带上；
-3. 再用 Gradle 编 debug APK，产物在 Actions 的 `MuseFloatX-Local-debug-apk` 里。
-
-首次使用时 App 会把 assets 里的 llama-server 复制到应用私有目录并 chmod +x 再启动，assets 里的文件不能直接执行，这一步是必须的。
+1. 用 CMake + Android NDK r27c 编 llama-server（arm64-v8a，最新 llama.cpp master，支持 Qwen3.5 的 Gated DeltaNet），静态编译（`BUILD_SHARED_LIBS=OFF`，`ANDROID_STL=c++_static`）；
+2. 把产物放进 `app/src/main/jniLibs/arm64-v8a/libllama_server.so`，再用 Gradle 编 debug APK，产物在 Actions 的 `MuseFloatX-Local-debug-apk` 里；
+3. 编完还要验证 APK 内容（见上面“打包与启动”第 1–4 条），验证不过就算编译成功了也不算交付。
 
 本地 Gradle 编译以前走不通，不要回头折腾本地编，直接看 Actions 结果。
+
+## 启动失败诊断（主界面就有）
+
+主界面新增“检查本地服务启动”按钮：点它会尝试启动本地服务，然后显示诊断全文——原生库路径、文件大小、服务是否在跑、最后一次真实报错原文、进程日志尾部。
+
+启动失败时不要只说“失败”：**把诊断全文截图或发回来**。Permission denied、找不到某个 .so、进程提前退出、加载超时，各自的修法完全不一样，没有原文没法定位。
+
+## 真机离线生成测试步骤（小米 14 Pro，安装修复后的 APK 后按顺序做）
+
+1. **装新版，不要在旧版上直接覆盖出问题时还分不清版本**：确认主界面写的是“本地版 1.0”，并且主界面诊断里原生库文件大小是几十 MB（不是几 KB）；
+2. **下载模型**：连 WiFi，点“下载模型”，等到状态变成“已下载”，约 1.40GB；下载中途断了可以点下载续传；
+3. **先做启动诊断**：点“检查本地服务启动”，看结果是“成功”还是“失败”。失败时把诊断全文发回来，不要只发“失败”两个字；
+4. **断网**：下载完之后，把手机网络彻底断开（关 WiFi、关流量，或者开飞行模式），再做下一步——这一步就是验证“下载后真正离线”；
+5. **点球生成**：在 X 里复制一条帖子，点悬浮球，看面板是不是出来、是不是读到了剪贴板、是不是开始流式出字、最后是不是出一句完整回复；
+6. **记三个数**：第一次点球到首字几秒、到出完几秒、第二次点球是不是明显变快（第一次要加载模型，第二次应该快很多）；
+7. **关球卸载**：关掉悬浮球，再看一眼主界面诊断，确认服务已经不在跑（卸载了），手机没有因为常驻模型变卡；10 分钟不生成也会自动卸载，下次点球会重新加载，这是正常的，不是故障。
 
 ## 安全 / 边界
 
