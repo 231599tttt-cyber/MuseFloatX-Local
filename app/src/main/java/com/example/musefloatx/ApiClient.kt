@@ -222,6 +222,18 @@ object ApiClient {
                 } else {
                     val start = text.indexOf("<think")
                     if (start < 0) {
+                        // 修复（2026-11-02）：块边界把 "<think" 切开时
+                        // （例如本块末尾只有 "<th"），旧代码会把 "<th"
+                        // 当正文发出，下一块的 "ink>..." 也当正文发出，
+                        // 思考标签就漏网了。改为：末尾若是 "<think" 的
+                        // 前缀片段，先留在 buf 里，等下一块补全再判断。
+                        val lastLt = text.lastIndexOf("<")
+                        val tail = if (lastLt >= 0) text.substring(lastLt) else ""
+                        if (lastLt >= 0 && "<think".startsWith(tail) && tail.length < 6) {
+                            out.append(text.substring(0, lastLt))
+                            text = tail
+                            break
+                        }
                         out.append(text)
                         text = ""
                     } else {
@@ -269,14 +281,14 @@ object ApiClient {
         }
     }
 
-    private fun buildBody(style: String, postText: String, stream: Boolean, modelAlias: String, reasoningMode: String = "off", maxTokensOverride: Int? = null): JSONObject {
+    private fun buildBody(style: String, postText: String, stream: Boolean, modelAlias: String, reasoningMode: String = "off", maxTokensOverride: Int? = null, systemOverride: String? = null): JSONObject {
         // 三种风格各用完整前置（styleSystemPrompt），不再拼 V38 短句。
         // 思考模式默认关、可选（服务端 --reasoning 跟随用户选择），温度 0.7 不变。
         // max_tokens 跟随思考模式：思考开/自动时抬高，防思考耗尽预算出空回复。
         // model 必须是当前选用模型的 alias（2B 或 4B），不能写死 2B：
         // llama-server 启动时 --alias 起的名字和这里必须一致，否则
         // 切换到 4B 后请求还会去找 2B 的名字。
-        val system = styleSystemPrompt(style)
+        val system = systemOverride ?: styleSystemPrompt(style)
         val user = "X 帖子：\n" + postText.take(2000) + "\n回一条，别自动发送。"
         return JSONObject().apply {
             put("model", modelAlias)
@@ -488,8 +500,9 @@ object ApiClient {
      *   180 token 内只输出了思考/标签就被截断，重试一次把上限
      *   放到 400（自然/幽默）/200（简短），仍在 1024 上下文内，
      *   给模型留出走出思考段、说出正文的空间。
-     * - 最多重试一次，绝不循环重试。面板流式路径不走这里，仍遵守
-     *   单飞行、不自动第二通的规则。
+     * - 重试有界：思考模式最多重试一次（用思考关闭）；思考关闭
+     *   最多重试两次（先放宽上限、再用短提示词），绝不循环重试。
+     *   面板流式路径不走这里，仍遵守单飞行、不自动第二通的规则。
      */
     suspend fun generate(
         context: Context,
@@ -525,7 +538,10 @@ $diag
                     "建议：保持思考关闭再试；若思考关闭也空，请检查模型文件大小与诊断")
             )
         }
-        // 思考关闭：把上限放宽重试一次。
+        // 思考关闭：先把上限放宽重试一次；仍空则用一句短提示词
+        // 再试一次——长提示词（含防冒充硬约束）本身可能把 2B 带进
+        // 长思考/标签段、180 token 内走不出来，短提示词能验证
+        // 是不是提示词把正文挤没了，而不是模型文件坏了。
         if (mode == "off") {
             val bigger = if (style == "简短") 200 else 400
             val retry = doGenerate(context, contextTokens, style, postText, "off", bigger)
@@ -534,8 +550,17 @@ $diag
                     "（注意：首次生成在 180/80 token 内被截断为空，已自动放宽上限到 $bigger 重生成一次并成功）"
                 return retry
             }
+            val simplePrompt = "你是一个推特（X）的回复助手。直接用口语回一条，一两句就行，只输出回复正文，不要思考过程，不要输出<think>标签，不要带标签。"
+            val retry2 = doGenerate(context, contextTokens, style, postText, "off", bigger, simplePrompt)
+            if (retry2.isSuccess) {
+                lastGenerationDiagnostics = lastGenerationDiagnostics +
+                    "（注意：放宽上限后仍为空，已自动用短提示词重生成一次并成功；说明长提示词可能把 2B 带偏了，短提示词更稳）"
+                return retry2
+            }
         }
-        return first
+        // 最终失败时附上模型/alias/端口，方便对照是不是请求发错了地方。
+        val modelInfo = "当前选用模型：${selectedModel.displayName}，文件：${selectedModel.fileName}，请求 alias：${selectedModel.alias}，服务：${LocalConfig.LOCAL_BASE_URL}"
+        return Result.failure(Exception((first.exceptionOrNull()?.message ?: "本地模型返回了空回复") + "\n$modelInfo"))
     }
 
     /** 非流式生成的一次实际请求（forcedMode 非空时临时用该思考模式启动服务，不改用户设置）。 */
@@ -545,7 +570,8 @@ $diag
         style: String,
         postText: String,
         forcedMode: String?,
-        maxTokensOverride: Int?
+        maxTokensOverride: Int?,
+        systemOverride: String? = null
     ): Result<String> = withContext(Dispatchers.IO) {
         val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens, forcedMode)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
@@ -559,7 +585,7 @@ $diag
                 .url("${LocalConfig.LOCAL_BASE_URL}/v1/chat/completions")
                 .addHeader("Authorization", "Bearer local")
                 .addHeader("Content-Type", "application/json")
-                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, nonStreamMode, maxTokensOverride).toString().toRequestBody("application/json".toMediaType()))
+                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, nonStreamMode, maxTokensOverride, systemOverride).toString().toRequestBody("application/json".toMediaType()))
                 .build()
             val call = nonStreamClient.newCall(req)
             activeCall = call

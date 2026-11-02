@@ -101,6 +101,8 @@ object LocalServer {
 
     @Volatile private var runningReasoningMode: String? = null
         private set
+    @Volatile private var runningModelId: String? = null
+        private set
 
     /** 指定模型的落盘文件；不传模型时用当前选用模型。 */
     fun modelFile(context: Context, model: LocalModel = selectedModel(context)): File {
@@ -175,6 +177,7 @@ object LocalServer {
         sb.append("思考模式（用户选择）：").append(reasoningMode(context))
             .append("（off=关闭快，auto=自动，on=开启慢但可能更准）\n")
         sb.append("正在跑的服务用的思考模式：").append(runningReasoningMode ?: "（服务没在跑）").append("\n")
+        sb.append("正在跑的服务用的模型：").append(runningModelId ?: "（服务没在跑）").append("\n")
         sb.append("当前模型文件：").append(modelFile(context, selected).absolutePath).append("\n")
         sb.append("当前模型已下载：").append(if (isModelDownloaded(context, selected)) "是" else "否").append("\n")
         for (m in LocalConfig.MODELS) {
@@ -278,8 +281,14 @@ object LocalServer {
      * 重生成一次，不改用户持久化的思考模式选择）。 */
     suspend fun ensureStarted(context: Context, contextTokens: Int, reasoningOverride: String? = null): Boolean = mutex.withLock {
         val wantedReasoning = reasoningOverride ?: reasoningMode(context)
+        val selectedEarly = selectedModel(context)
         if (isRunning && process?.isAlive == true) {
-            if (runningReasoningMode == wantedReasoning) {
+            // 修复（2026-11-02）：旧代码只比对思考模式，不比对模型。
+            // 若服务是按旧模型起的（例如先起 2B、切换后没停干净），
+            // 这里会误判“服务已起”而直接复用，请求里的 model alias
+            // 与实际加载的文件不一致，生成就可能异常或为空。
+            // 模型或思考模式任一不一致，都杀旧重起。
+            if (runningReasoningMode == wantedReasoning && runningModelId == selectedEarly.id) {
                 cancelIdleUnloadLocked()
                 return true
             }
@@ -295,6 +304,7 @@ object LocalServer {
             process = null
             isRunning = false
             runningReasoningMode = null
+            runningModelId = null
             var waitedMs = 0
             while (waitedMs < 10_000 && isHealthy()) {
                 delay(200)
@@ -309,7 +319,7 @@ object LocalServer {
         // 就是新模型的文件和 alias；旧模型文件还留在手机里，不会被删。
         // 模型文件先显式校验：不存在、大小不对都直接报模型问题，
         // 绝不能放行一个错名/不完整文件去生成、最后变成误导性空回复。
-        val selected = selectedModel(context)
+        val selected = selectedEarly
         val modelErr = validateModelFile(context, selected)
         if (modelErr != null) {
             lastError = modelErr
@@ -387,6 +397,7 @@ object LocalServer {
             }
             isRunning = ok
             runningReasoningMode = if (ok) wantedReasoning else null
+            runningModelId = if (ok) selected.id else null
             if (!ok) {
                 val tail = serverLogTail(context)
                 lastError = if (exitCode != null) {
@@ -407,6 +418,7 @@ object LocalServer {
             process = null
             isRunning = false
             runningReasoningMode = null
+            runningModelId = null
             false
         }
     }
@@ -466,6 +478,7 @@ object LocalServer {
         process = null
         isRunning = false
         runningReasoningMode = null
+        runningModelId = null
     }
 
     /** 供 MainActivity 测试/诊断用：不经过 FloatingService 也能起服务，测完同样会闲置卸载。 */
