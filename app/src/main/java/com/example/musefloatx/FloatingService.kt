@@ -419,6 +419,11 @@ class FloatingService : Service() {
                         // 就这样，不需要再手动贴一次、再点一次生成。
                         // 自动读不到时，面板会提示先复制再点球，关面板、重新复制、
                         // 再点球就是新的一次提交，不再留一个多余的生成按钮。
+                        // 按钮不能打架（2026-11-02 用户特别强调，之前出过共用
+                        // busy key 的 bug）：四个风格按钮不共用任何 busy key，
+                        // 每个按钮的选中态只看自己 styleState == s，生成中状态
+                        // 只写在 statusText 里，不会点一个、四个全变“正在…”；
+                        // 换风格时 setStyle 先取消旧通再提交新通，见下。
                         Text("风格", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                         Row {
                             listOf("自然", "幽默", "简短", "友好").forEach { s ->
@@ -489,6 +494,11 @@ class FloatingService : Service() {
             return
         }
         if (isGenerating) {
+            // 先把代号 +1 再取消：旧流即使在取消与新提交之间晚到，
+            // 代号已不符，块与最终结果都写不回面板；再断 HTTP、取消协程。
+            // 这保证自然→幽默→简短→友好依次点时，每次都是先取消旧通、
+            // 再提交新通一通，绝不并发两通。
+            generateSeq += 1
             generateJob?.cancel()
             ApiClient.cancelActive()
             isGenerating = false

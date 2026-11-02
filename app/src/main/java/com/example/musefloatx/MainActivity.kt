@@ -476,6 +476,12 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(16.dp))
 
                     Text("4. 风格（默认风格，面板里也能换）", fontWeight = FontWeight.Bold)
+                    // 按钮不能打架：这四个风格按钮故意不走 runFeedback /
+                    // busyButton——选默认风格只是即时写偏好，没有异步活，
+                    // 所以根本没有 busy key，更不可能共用一个字符串；
+                    // 删除（删除模型-{id}）、思考（切换思考模式-{mode}）、
+                    // 测试、下载等其他按钮的 busy key 也各不相同，
+                    // 不会与风格按钮混用，也不会点一个风格就锁死另一个。
                     Row {
                         listOf("自然", "幽默", "简短", "友好").forEach { s ->
                             if (style == s) {
