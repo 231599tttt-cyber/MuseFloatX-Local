@@ -22,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -79,9 +80,16 @@ class MainActivity : ComponentActivity() {
                 var contextText by remember { mutableStateOf(store.contextTokens.toString()) }
                 var status by remember { mutableStateOf(modelStatusText()) }
                 var downloadProgress by remember { mutableStateOf("") }
+                // 下载进度条：0f~1f。原来只有一行小字“下载中：xxMB / xxMB”，
+                // 还在 IO 线程里每 64KB 就刷一次状态，用户根本看不到进度，
+                // 所以改成带进度条 + 百分比 + 速度 + 剩余时间的明显显示。
+                var downloadFraction by remember { mutableStateOf(0f) }
                 var testResult by remember { mutableStateOf("") }
                 var diagnostic by remember { mutableStateOf("") }
                 var engineTest by remember { mutableStateOf("") }
+                // 测试引擎输出折叠状态：成功（退出码 0）时默认收起，只看结论；
+                // 失败时默认展开，方便把完整输出发回来定位。用户可随时手动展开/收起。
+                var engineOutputExpanded by remember { mutableStateOf(false) }
                 var showWifiDialog by remember { mutableStateOf(false) }
                 var tick by remember { mutableStateOf(0) }
                 @Suppress("UNUSED_VARIABLE")
@@ -96,7 +104,7 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             TextButton(onClick = {
                                 showWifiDialog = false
-                                startDownload(scope, { p -> downloadProgress = p }, { s -> status = s; tick += 1 })
+                                startDownload(scope, { p, f -> downloadProgress = p; downloadFraction = f }, { s -> status = s; tick += 1 })
                             }) { Text("继续下载") }
                         },
                         dismissButton = {
@@ -130,20 +138,49 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(16.dp))
 
                     Text("先做：测试本地引擎（模型还没下载也能点，先做这一步）", fontWeight = FontWeight.Bold)
-                    Text("顺序必须是：先点下面这个按钮，确认底层引擎能启动，再下载模型。点它只会跑 llama-server --help，不带模型、不启动服务端口、不需要模型文件。它会把标准输出、标准错误、退出码、耗时全部原样显示出来。--help 能跑通（有帮助输出、退出码 0），才说明可执行文件和依赖库能正常启动；跑不通（比如 Permission denied、找不到某个 .so）就不要先去下载 1.4GB 模型，先把这段输出发回来。", fontSize = 13.sp)
+                    Text("顺序必须是：先点下面这个按钮，确认底层引擎能启动，再下载模型。点它只会跑 llama-server --help，不带模型、不启动服务端口、不需要模型文件。--help 能跑通（有帮助输出、退出码 0），才说明可执行文件和依赖库能正常启动；跑不通（比如 Permission denied、找不到某个 .so）就不要先去下载 1.4GB 模型，先把这段输出发回来。", fontSize = 13.sp)
                     Button(onClick = {
                         engineTest = "正在运行 llama-server --help…（应该几秒内出结果）"
+                        engineOutputExpanded = false
                         scope.launch {
-                            engineTest = LocalServer.testEngine(this@MainActivity)
+                            val result = LocalServer.testEngine(this@MainActivity)
+                            engineTest = result
+                            // 成功时默认收起（--help 原文很长，不用一屏全摊开）；
+                            // 失败时默认展开，方便把完整输出发回来定位。
+                            engineOutputExpanded = !result.contains("结论：--help 跑通了")
                         }
                     }) { Text("测试本地引擎（llama-server --help）") }
-                    if (engineTest.isNotBlank()) Text(engineTest, fontSize = 12.sp)
+                    if (engineTest.isNotBlank()) {
+                        if (engineTest.startsWith("正在运行")) {
+                            Text(engineTest, fontSize = 12.sp)
+                        } else {
+                            // 摘要行：只取退出码、耗时、结论三行，成功时先只看这个。
+                            val summaryLines = engineTest.lines().filter { line ->
+                                line.startsWith("退出码") || line.startsWith("耗时") || line.startsWith("结论")
+                            }
+                            if (summaryLines.isNotEmpty()) {
+                                Text(summaryLines.joinToString("\n"), fontSize = 12.sp)
+                            }
+                            OutlinedButton(onClick = { engineOutputExpanded = !engineOutputExpanded }) {
+                                Text(if (engineOutputExpanded) "收起完整输出" else "展开查看完整输出（--help 原文很长）")
+                            }
+                            if (engineOutputExpanded) Text(engineTest, fontSize = 12.sp)
+                        }
+                    }
                     Spacer(Modifier.height(16.dp))
 
                     Text("2. 本地模型：Qwen3.5-2B Q4_K_M", fontWeight = FontWeight.Bold)
                     Text("来源：bartowski/Qwen_Qwen3.5-2B-GGUF（原模型 Qwen/Qwen3.5-2B，本身就是后训练对话版本，不是 Base 版），文件 Qwen3.5-2B-Q4_K_M.gguf，约 1.40GB。首次下载一次，之后完全离线。", fontSize = 13.sp)
                     Text(status, fontSize = 13.sp)
-                    if (downloadProgress.isNotBlank()) Text(downloadProgress, fontSize = 13.sp)
+                    if (downloadProgress.isNotBlank()) {
+                        Text(downloadProgress, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        LinearProgressIndicator(
+                            progress = { downloadFraction },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
                     Row {
                         Button(
                             onClick = {
@@ -154,7 +191,7 @@ class MainActivity : ComponentActivity() {
                                 if (!isWifi()) {
                                     showWifiDialog = true
                                 } else {
-                                    startDownload(scope, { p -> downloadProgress = p }, { s -> status = s; tick += 1 })
+                                    startDownload(scope, { p, f -> downloadProgress = p; downloadFraction = f }, { s -> status = s; tick += 1 })
                                 }
                             },
                             modifier = Modifier.padding(end = 8.dp)
@@ -263,16 +300,38 @@ class MainActivity : ComponentActivity() {
 
     private fun startDownload(
         scope: kotlinx.coroutines.CoroutineScope,
-        onProgress: (String) -> Unit,
+        onProgress: (String, Float) -> Unit,
         onDone: (String) -> Unit
     ) {
         scope.launch {
-            onProgress("开始下载…")
+            onProgress("开始下载…", 0f)
+            // 为什么原来“根本看不到”：下载器每读 64KB 就回调一次，
+            // 一秒能刷几百次状态，界面根本来不及画；而且回调在 IO 线程，
+            // 不是主线程更新。所以这里节流到每 500 毫秒刷一次，
+            // 并且用 scope.launch 发到主线程更新，并算速度和剩余时间。
+            val startMs = System.currentTimeMillis()
+            var firstDownloaded: Long? = null
+            var lastUpdateMs = 0L
             val r = ModelDownloader.download(this@MainActivity) { downloaded, total ->
-                onProgress("下载中：${downloaded / 1024 / 1024}MB / ${total / 1024 / 1024}MB")
+                if (firstDownloaded == null) firstDownloaded = downloaded
+                val now = System.currentTimeMillis()
+                val fraction = if (total > 0) (downloaded.toFloat() / total).coerceIn(0f, 1f) else 0f
+                if (now - lastUpdateMs < 500 && fraction < 1f) return@download
+                lastUpdateMs = now
+                val elapsedSec = ((now - startMs) / 1000.0).coerceAtLeast(1.0)
+                val deltaMB = ((downloaded - (firstDownloaded ?: downloaded)) / 1024.0 / 1024.0)
+                val speedMBs = deltaMB / elapsedSec
+                val percent = (fraction * 100).toInt()
+                val etaText = if (speedMBs > 0.1) {
+                    val remainSec = ((total - downloaded) / 1024.0 / 1024.0 / speedMBs).toLong()
+                    if (remainSec >= 60) "，还剩约 ${remainSec / 60} 分 ${remainSec % 60} 秒" else "，还剩约 $remainSec 秒"
+                } else ""
+                val speedText = if (speedMBs > 0.1) "，${"%.1f".format(speedMBs)}MB/秒" else ""
+                val text = "下载中：$percent% · ${downloaded / 1024 / 1024}MB / ${total / 1024 / 1024}MB$speedText$etaText"
+                scope.launch { onProgress(text, fraction) }
             }
             r.fold(
-                { onDone(it); onProgress("") },
+                { onDone(it); onProgress("", 1f) },
                 { onDone(it.message ?: "下载失败") }
             )
         }

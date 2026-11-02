@@ -22,8 +22,12 @@ import java.net.URL
  * - 悬浮球关闭时卸载：FloatingService.onDestroy / STOP 里调 stop()。
  * - 10 分钟无生成自动卸载：每次生成结束调 markUsed()，之后 10 分钟
  *   没有新生成就自动 stop()，释放内存；下次点球再重新加载。
- * - mmap 加载：启动参数里显式传 --mmap，让系统可以在内存紧张时
- *   回收模型页，而不是一直钉死 1.6GB。
+ * - mmap 加载：新版 llama-server 里 mmap 是默认开启的，
+ *   只有 --no-mmap 这个反向开关，没有 --mmap 这个参数；
+ *   2026-11-02 真机实测：传 --mmap 会直接报
+ *   error: invalid argument: --mmap、进程 exitCode=1 提前退出，
+ *   所以这里故意不传任何 mmap 参数，就是默认 mmap，
+ *   系统可以在内存紧张时回收模型页，而不是一直钉死 1.6GB。
  *
  * 聊天模板（用户纠正的第 2 点）：
  * - 不传 --chat-template、不用自定义模板，让 llama-server 直接用模型
@@ -239,7 +243,9 @@ object LocalServer {
                 "--port", LocalConfig.LOCAL_PORT.toString(),
                 "-c", ctx.toString(),
                 "-t", LocalConfig.THREADS.toString(),
-                "--mmap",
+                // 注意：不要传 --mmap，新版 llama-server 不认这个参数，
+                // 传了就报 invalid argument: --mmap、exitCode=1 提前退出。
+                // mmap 本来就是默认的，不传就是 mmap。
                 "-b", "512",
                 "--log-disable"
                 // 注意：故意不传 --chat-template，让模型自带模板决定非思考模式。

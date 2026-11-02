@@ -23,9 +23,17 @@ object LocalConfig {
     const val MODEL_REPO = "bartowski/Qwen_Qwen3.5-2B-GGUF"
     /** 原模型。 */
     const val MODEL_ORIGINAL = "Qwen/Qwen3.5-2B"
-    /** 下载 URL（带 Qwen_ 前缀的实际文件名，否则 404）。 */
+    /**
+     * 下载 URL（带 Qwen_ 前缀的实际文件名，否则 404）。
+     * 2026-11-02 真机反馈：国内直连 huggingface.co 会 30 秒连接超时
+     * （failed to connect to huggingface.co port 443 after 30000ms），
+     * 不是文件不存在、也不是手机问题。所以默认改走国内镜像 hf-mirror.com，
+     * 它就是 huggingface.co 的镜像，同一文件、SHA 校验不变；
+     * 原官方地址：https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_K_M.gguf
+     * 下一版编出来后，不用翻墙也能直接下载；当前手机上的旧版仍是直连地址。
+     */
     const val MODEL_DOWNLOAD_URL =
-        "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_K_M.gguf"
+        "https://hf-mirror.com/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_K_M.gguf"
     /** 落盘文件名。 */
     const val MODEL_FILE_NAME = "Qwen3.5-2B-Q4_K_M.gguf"
     /** 量化。 */
