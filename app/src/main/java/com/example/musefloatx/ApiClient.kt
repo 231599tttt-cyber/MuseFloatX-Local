@@ -199,28 +199,17 @@ object ApiClient {
 
     /**
      * 去掉生成结果开头的字面 "null" 前缀（2026-11-02 真机实测：
-     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头；后又实测
-     * "nullwtf？这谁啊，瞎装啊？"，null 紧贴英文俚语）。
-     * 只去开头一个前缀，句中出现的 null 不动。
-     * 收窄的豁免（2026-11-02 修复）：旧规则是 null 后紧跟
-     * 任何字母/数字都不去，结果把 "nullwtf" 漏网了。
-     * 现只豁免以 null 开头的真词：nullify（含 nullified /
-     * nullifies）与 nullification / nullity（含 nullities）
-     * ——即去掉 null 后剩余部分以 "ifi"（ify / ified / ifies /
-     * ification）或 "ity" / "ities" 开头时不动；其余情况
-     * （包括 "nullwtf"、"null123"）一律去掉开头 null。
+     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头）。
+     * 只去开头一个前缀，且 "null" 后不能紧跟英文字母/数字
+     * （避免误伤 nullify 之类正常单词）；句中出现的 null 不动。
      * 开头标点/空格一并清掉。流式路径的最终文本和非流式路径
      * 都走这里，空判断之前就先清掉，免得 "null" 被当成正文显示。
      */
     fun stripLeadingNull(text: String): String {
         var t = text.trim()
-        if (t.length >= 4 && t.substring(0, 4).equals("null", ignoreCase = true)) {
-            if (t.length == 4) return ""
-            val rest = t.substring(4).lowercase()
-            val isRealWord = rest.startsWith("ifi") ||
-                rest.startsWith("ity") ||
-                rest.startsWith("ities")
-            if (!isRealWord) {
+        if (t.length > 4 && t.substring(0, 4).equals("null", ignoreCase = true)) {
+            val next = t[4]
+            if (!(next in 'A'..'Z' || next in 'a'..'z' || next in '0'..'9')) {
                 t = t.substring(4).trimStart(' ', '，', ',', '、', ':', '：', '·', '.', '。')
             }
         }
