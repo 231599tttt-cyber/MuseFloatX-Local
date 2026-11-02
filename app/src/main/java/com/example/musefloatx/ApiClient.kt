@@ -290,24 +290,47 @@ object ApiClient {
         }
     }
 
+    /**
+     * 思考/自动模式“根本没反应”的根因（2026-11-02 真机实测后定位，
+     * 不是猜测）：思考开/自动时，llama-server 先流式返回大量
+     * reasoning_content（或 <think> 段），正文 content 要等思考结束
+     * 才开始。旧代码把 reasoning_content 只记一个布尔标记、绝不显示，
+     * ThinkFilter 又把 <think> 段全部丢掉，于是面板在思考阶段
+     * 一直停在“生成中…”、一个字都不出；手机上 2B 生成思考又慢，
+     * 很容易超过 OkHttp 120 秒读超时才报错，用户看到的就是
+     * “半天没反应”。修法不是发明一个 llama.cpp 没有的思考 token
+     * 上限参数（--reasoning 只有 on/off/auto 三档，没有 token 上限），
+     * 而是：(a) 一收到思考就立刻回调 onReasoning，让面板显示
+     * “正在思考…”；(b) 思考模式下 60 秒内没出正文就主动失败，
+     * 给出明确诊断和“换回思考关闭”的建议，而不是静默挂着；
+     * (c) 思考关时行为、超时、token 上限全部原样不动。
+     */
     suspend fun generateStream(
         context: Context,
         contextTokens: Int,
         style: String,
         postText: String,
-        onDelta: (String) -> Unit
+        onDelta: (String) -> Unit,
+        onReasoning: () -> Unit = {}
     ): Result<String> = withContext(Dispatchers.IO) {
         val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
+        val mode = reasoningMode(context)
+        // 思考模式下读超时收紧到 60 秒：思考流本身会持续来行，
+        // 但 60 秒没收到任何行也该明确失败，而不是等 120 秒。
+        // 思考关时用原客户端（120 秒），行为原样不动。
+        val callClient = if (mode == "off") client
+            else client.newBuilder().readTimeout(60, TimeUnit.SECONDS).build()
+        val streamStartMs = System.currentTimeMillis()
         try {
             val req = Request.Builder()
                 .url("${LocalConfig.LOCAL_BASE_URL}/v1/chat/completions")
                 .addHeader("Authorization", "Bearer local")
                 .addHeader("Content-Type", "application/json")
                 .addHeader("Accept", "text/event-stream")
-                .post(buildBody(style, postText, true, LocalServer.selectedModel(context).alias, reasoningMode(context)).toString().toRequestBody("application/json".toMediaType()))
+                .post(buildBody(style, postText, true, LocalServer.selectedModel(context).alias, mode).toString().toRequestBody("application/json".toMediaType()))
                 .build()
-            val call = client.newCall(req)
+            val call = callClient.newCall(req)
             activeCall = call
             try {
                 call.execute().use { resp ->
@@ -328,6 +351,13 @@ object ApiClient {
                     // 句中出现的 null 不动，只处理开头。
                     val emitted = StringBuilder()
                     var reasoningSeenInStream = false
+                    var reasoningNotified = false
+                    fun notifyReasoning() {
+                        if (!reasoningNotified) {
+                            reasoningNotified = true
+                            try { onReasoning() } catch (_: Exception) { }
+                        }
+                    }
                     while (true) {
                         val line = try { source.readUtf8Line() } catch (_: Exception) { break } ?: break
                         if (!line.startsWith("data:")) continue
@@ -345,8 +375,12 @@ object ApiClient {
                             // 增量：它绝不能显示，也绝不能被当成正文，只记
                             // 一个“见过思考”的标记，供最后空回复时诊断用。
                             val reasoningPiece = delta?.optString("reasoning_content", "") ?: ""
-                            if (reasoningPiece.isNotBlank()) reasoningSeenInStream = true
+                            if (reasoningPiece.isNotBlank()) {
+                                reasoningSeenInStream = true
+                                notifyReasoning()
+                            }
                             val piece = delta?.optString("content", "") ?: ""
+                            if (piece.contains("<think")) notifyReasoning()
                             if (piece.isNotEmpty()) {
                                 val visible = filter.feed(piece)
                                 if (visible.isNotEmpty()) {
@@ -369,6 +403,25 @@ object ApiClient {
                             }
                         } catch (_: Exception) {
                             // 跳过个别畸形行，不中断整段流
+                        }
+                        // 思考模式 60 秒无正文保护：思考流在持续来行时，
+                        // 读超时不会触发，但用户面板不能无限停在“生成中…”。
+                        // 60 秒内只收到思考、一个正文字都没出，就主动失败，
+                        // 并明确建议换回思考关闭。思考关时此分支不启用
+                        // （mode == "off" 时 reasoningSeen 正常应为 false，
+                        // 且 off 本来就 1-2 秒出正文，不会走到这里）。
+                        if (mode != "off" && reasoningSeenInStream && emitted.isEmpty() &&
+                            System.currentTimeMillis() - streamStartMs > 60_000L
+                        ) {
+                            try { call.cancel() } catch (_: Exception) { }
+                            return@withContext Result.failure(
+                                Exception(
+                                    "思考模式下 60 秒内没有收到正文（已收到思考内容，" +
+                                        "思考可能过长或被思考耗尽了 token 预算；" +
+                                        "finish_reason=未完成；reasoning_content 存在=是；" +
+                                        "建议：换回思考关闭再试，思考关闭仍是 1-2 秒的快模式）"
+                                )
+                            )
                         }
                     }
                     sb.append(filter.flush())
@@ -398,7 +451,21 @@ object ApiClient {
                 LocalServer.markUsed()
             }
         } catch (e: Exception) {
-            Result.failure(Exception(e.message ?: "本地生成失败"))
+            val msg = e.message ?: "本地生成失败"
+            val isTimeout = e is java.net.SocketTimeoutException ||
+                msg.contains("timeout", ignoreCase = true) ||
+                msg.contains("超时")
+            if (mode != "off" && isTimeout) {
+                Result.failure(
+                    Exception(
+                        "思考模式下 60 秒内没有收到数据（思考可能过长；" +
+                            "原始错误：$msg）。建议：换回思考关闭再试，" +
+                            "思考关闭仍是 1-2 秒的快模式；思考开/自动不保证更快或更好。"
+                    )
+                )
+            } else {
+                Result.failure(Exception(msg))
+            }
         }
     }
 
@@ -410,14 +477,19 @@ object ApiClient {
     ): Result<String> = withContext(Dispatchers.IO) {
         val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
+        val nonStreamMode = reasoningMode(context)
+        // 非流式（主界面测试）同样：思考模式下 60 秒读超时即明确失败，
+        // 不再静默等 120 秒；思考关时用原客户端，行为原样不动。
+        val nonStreamClient = if (nonStreamMode == "off") client
+            else client.newBuilder().readTimeout(60, TimeUnit.SECONDS).build()
         try {
             val req = Request.Builder()
                 .url("${LocalConfig.LOCAL_BASE_URL}/v1/chat/completions")
                 .addHeader("Authorization", "Bearer local")
                 .addHeader("Content-Type", "application/json")
-                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, reasoningMode(context)).toString().toRequestBody("application/json".toMediaType()))
+                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, nonStreamMode).toString().toRequestBody("application/json".toMediaType()))
                 .build()
-            val call = client.newCall(req)
+            val call = nonStreamClient.newCall(req)
             activeCall = call
             try {
                 call.execute().use { resp ->
@@ -436,7 +508,19 @@ object ApiClient {
                 LocalServer.markUsed()
             }
         } catch (e: Exception) {
-            Result.failure(Exception(e.message ?: "本地生成失败"))
+            val msg = e.message ?: "本地生成失败"
+            val isTimeout = e is java.net.SocketTimeoutException ||
+                msg.contains("timeout", ignoreCase = true) || msg.contains("超时")
+            if (nonStreamMode != "off" && isTimeout) {
+                Result.failure(
+                    Exception(
+                        "思考模式下 60 秒内没有返回正文（思考可能过长；原始错误：$msg）。" +
+                            "建议：换回思考关闭再试，思考关闭仍是 1-2 秒的快模式。"
+                    )
+                )
+            } else {
+                Result.failure(Exception(msg))
+            }
         }
     }
 

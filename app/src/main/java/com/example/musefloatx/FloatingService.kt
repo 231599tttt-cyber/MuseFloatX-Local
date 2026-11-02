@@ -515,14 +515,18 @@ class FloatingService : Service() {
         generateSeq += 1
         val mySeq = generateSeq
         isGenerating = true
-        statusText = "生成中…"
+        // 思考/自动模式一开始就明说在思考：旧版面板一直只写“生成中…”、
+        // 思考阶段又一个字都不出，用户看到的就是“根本没反应”。
+        // 思考关时仍写“生成中…”，行为原样不动。
+        statusText = if (ApiClient.reasoningMode(this@FloatingService) == "off") "生成中…"
+            else "正在思考…（思考模式已开，模型先想一遍再回答，可能会慢，请稍等）"
         replyText = ""
         generateJob = scope.launch {
             // 流式一次：字一出来就先显示，不用等全文。
             // 流式失败且一字没出时，不再自动发第二通非流式兜底——
             // 那就是第二次提交、第二次生成、第二次传输，只会更慢。
             // 直接报错，用户等当前结束、再点重新生成，那才是新的一次提交。
-            val streamResult = ApiClient.generateStream(this@FloatingService, store.contextTokens, styleState, text) { piece ->
+            val streamResult = ApiClient.generateStream(this@FloatingService, store.contextTokens, styleState, text, { piece ->
                 if (mySeq == generateSeq) {
                     replyText += piece
                     // 第二层防闪烁：ApiClient 流里已经按块去开头 null，
@@ -532,7 +536,13 @@ class FloatingService : Service() {
                     val cleaned = ApiClient.stripLeadingNull(replyText)
                     if (cleaned != replyText) replyText = cleaned
                 }
-            }
+            }, {
+                // 思考回调：模型一开始流式返回思考内容就立刻显示
+                // “正在思考…”，而不是等到正文才有动静。
+                if (mySeq == generateSeq && replyText.isBlank()) {
+                    statusText = "正在思考…（思考模式已开，模型先想一遍再回答，可能会慢，请稍等）"
+                }
+            })
             if (mySeq != generateSeq) return@launch
             if (streamResult.isSuccess) {
                 replyText = streamResult.getOrNull()?.trim() ?: replyText

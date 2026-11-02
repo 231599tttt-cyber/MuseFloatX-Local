@@ -114,7 +114,11 @@ object LocalConfig {
         id = "4B",
         displayName = "Qwen3.5-4B Q4_K_M",
         repo = "bartowski/Qwen_Qwen3.5-4B-GGUF",
-        downloadUrl = "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+        // 2026-11-02 用户紧急要求：仅 4B 改走国内镜像 hf-mirror.com，
+        // 因为官方直连下载太慢。镜像与官方是同一文件（SHA256 校验不变，
+        // 见本文件 sha256 字段，下载完成后仍按此校验），UI 仍显示约 3.01GB。
+        // 2B 绝不动：仍用 huggingface.co 官方地址，见 MODEL_2B。
+        downloadUrl = "https://hf-mirror.com/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf",
         fileName = "Qwen3.5-4B-Q4_K_M.gguf",
         expectedBytes = 3013027808L,
         sha256 = "13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983",
