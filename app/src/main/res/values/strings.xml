@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MuseFloatX 本地版</string>
+    <string name="accessibility_desc">用于在 X 应用前台时读取当前可见帖子文字，以便生成回复建议。只在你点击悬浮球时读取，不在后台持续收集，不读取私信内容，不自动发送。</string>
+</resources>

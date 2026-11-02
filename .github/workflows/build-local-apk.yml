@@ -1,0 +1,101 @@
+name: Build Local APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android platform and build tools
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: Install CMake and Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Set up Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+          local-cache: true
+
+      - name: Resolve NDK home
+        run: |
+          NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}"
+          if [ -z "$NDK_HOME" ]; then
+            NDK_HOME="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)"
+          fi
+          echo "NDK_HOME=$NDK_HOME"
+          test -f "$NDK_HOME/build/cmake/android.toolchain.cmake"
+          echo "NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+
+      - name: Clone llama.cpp (latest, Qwen3.5 / Gated DeltaNet support)
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          ls /tmp/llama.cpp
+
+      - name: Build llama-server for Android arm64-v8a
+        run: |
+          cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build-android \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_CURL=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_VULKAN=OFF \
+            -DGGML_OPENCL=OFF
+          cmake --build /tmp/llama.cpp/build-android --target llama-server -j"$(nproc)"
+          ls -lh /tmp/llama.cpp/build-android/bin/ || ls -lh /tmp/llama.cpp/build-android/tools/server/ || true
+          # llama.cpp puts the binary in bin/ in recent versions; fall back to a find.
+          BIN="$(find /tmp/llama.cpp/build-android -maxdepth 3 -name llama-server -type f | head -1)"
+          echo "llama-server binary: $BIN"
+          test -n "$BIN"
+          mkdir -p app/src/main/assets
+          cp "$BIN" app/src/main/assets/llama-server
+          ls -lh app/src/main/assets/llama-server
+          file app/src/main/assets/llama-server || true
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --console=plain --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MuseFloatX-Local-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload llama-server binary (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-arm64
+          path: app/src/main/assets/llama-server
+          if-no-files-found: warn
