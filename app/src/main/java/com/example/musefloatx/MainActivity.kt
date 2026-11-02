@@ -38,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -525,6 +526,45 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 OutlinedButton(
                                     onClick = {
+                                        // 取消 + 切回关闭（2026-11-02 用户要求）：
+                                        // 测试本地生成进行中时，思考“关闭”不能是
+                                        // 永久灰着点不了的状态，否则用户被卡在思考
+                                        // 模式里、只能干等 60 秒超时。点关闭时先
+                                        // 取消这次生成，再切回关闭：取消是立刻断
+                                        // HTTP 的，测试那通很快就会以“已取消生成”
+                                        // 收尾、busyButton 清掉，这里等它清掉（最
+                                        // 多 5 秒）再走正常切换；等不到就提示再点
+                                        // 一次，不要静默吞掉这次点击。取消只是取消
+                                        // 这次生成，不删模型、不停服务（切换本身
+                                        // 会停一次服务、那是切换的正常步骤）。
+                                        if (mode == "off" && busyButton == "测试本地生成") {
+                                            ApiClient.cancelGeneration()
+                                            toastShort("已取消这次生成，正在切回思考关闭…")
+                                            scope.launch {
+                                                var waited = 0
+                                                while (busyButton != null && waited < 50) {
+                                                    delay(100)
+                                                    waited += 1
+                                                }
+                                                if (busyButton == null) {
+                                                    runFeedback(
+                                                        key = "切换思考模式-off",
+                                                        busyText = "正在切换思考模式到关闭（快）…",
+                                                        work = {
+                                                            withContext(Dispatchers.IO) {
+                                                                LocalServer.stop()
+                                                            }
+                                                            store.reasoningMode = "off"
+                                                            reasoningMode = "off"
+                                                            "已切换思考模式为关闭（快），下次启动/生成时按新模式运行（最快）"
+                                                        }
+                                                    )
+                                                } else {
+                                                    toastShort("取消后仍在忙，请再点一次关闭")
+                                                }
+                                            }
+                                            return@OutlinedButton
+                                        }
                                         // 切换思考模式：先在 IO 线程停掉正在跑的服务
                                         // （stop 里有约 2 秒等待，主线程调会卡），
                                         // 再改选用值；LocalServer.ensureStarted()
@@ -545,27 +585,47 @@ class MainActivity : ComponentActivity() {
                                             }
                                         )
                                     },
-                                    enabled = busyButton == null,
+                                    // 只有思考“关闭”在测试进行中也可点（上面那条
+                                    // 取消 + 切回关闭的路）；其他思考按钮在忙时仍禁用，
+                                    // 避免在测试中途又去切自动/开启、把状态搅乱。
+                                    enabled = busyButton == null || (mode == "off" && busyButton == "测试本地生成"),
                                     modifier = Modifier.padding(end = 8.dp)
                                 ) { Text(buttonText) }
                             }
                         }
                     }
                     Spacer(Modifier.height(16.dp))
-                    Button(
-                        onClick = {
-                            runFeedback(
-                                key = "测试本地生成",
-                                busyText = "本地测试中…（首次要先加载模型，可能要十几秒）",
-                                work = {
-                                    val r = ApiClient.testLocal(this@MainActivity, store.contextTokens)
-                                    r.fold({ "本地测试成功：$it" }, { "本地测试失败：${it.message}" })
-                                },
-                                onResult = { result -> testResult = result }
-                            )
-                        },
-                        enabled = busyButton == null
-                    ) { Text(if (busyButton == "测试本地生成") "测试本地生成中…" else "测试本地生成") }
+                    Row {
+                        Button(
+                            onClick = {
+                                runFeedback(
+                                    key = "测试本地生成",
+                                    busyText = "本地测试中…（首次要先加载模型，可能要十几秒）",
+                                    work = {
+                                        val r = ApiClient.testLocal(this@MainActivity, store.contextTokens)
+                                        r.fold({ "本地测试成功：$it" }, { "本地测试失败：${it.message}" })
+                                    },
+                                    onResult = { result -> testResult = result }
+                                )
+                            },
+                            enabled = busyButton == null,
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) { Text(if (busyButton == "测试本地生成") "测试本地生成中…" else "测试本地生成") }
+                        // 取消（2026-11-02 用户要求）：只在测试进行中出现，
+                        // 其他按钮都禁用时它仍可点（和取消下载同例）。
+                        // 点取消立刻断这次 HTTP 请求，ApiClient 见取消标记
+                        // 就直接报“已取消生成”、不再重试，runFeedback 的
+                        // finally 会把按钮恢复空闲，不用等 60 秒超时。
+                        // 只取消这次生成，不改思考模式、不删模型、不停服务。
+                        if (busyButton == "测试本地生成") {
+                            OutlinedButton(
+                                onClick = {
+                                    ApiClient.cancelGeneration()
+                                    toastShort("已取消这次生成")
+                                }
+                            ) { Text("取消") }
+                        }
+                    }
                     if (testResult.isNotBlank()) Text(testResult, fontSize = 13.sp)
                     Spacer(Modifier.height(16.dp))
 

@@ -56,6 +56,21 @@ object ApiClient {
     }
 
     /**
+     * 用户手动取消标记（2026-11-02 取消按钮）：
+     * 点取消不只是断 OkHttp——断开后 doGenerate 的 catch 本来会把
+     * "Canceled" 当成普通失败、generate() 还可能再重试一次，那样
+     * 取消就白点了。所以取消时立 flag，doGenerate/generate() 见到
+     * flag 就直接返回“已取消生成”、不再重试；下一次新生成入口
+     * （generate()/generateStream() 开头）会把 flag 清掉，不影响下次。
+     * 取消只取消这次生成，不改思考模式、不删模型、不停服务。
+     */
+    @Volatile private var userCancelled = false
+    fun cancelGeneration() {
+        userCancelled = true
+        cancelActive()
+    }
+
+    /**
      * 最近一次非流式生成的诊断（主界面“测试本地生成”显示用）。
      * 目的：空回复时不再只报“空回复”让用户猜原因，而是直接给出
      * finish_reason、content 是否为空、reasoning_content 是否存在、
@@ -317,6 +332,9 @@ object ApiClient {
         onDelta: (String) -> Unit,
         onReasoning: () -> Unit = {}
     ): Result<String> = withContext(Dispatchers.IO) {
+        // 新的一通生成开始：清掉上一次取消留下的 flag，否则上次取消
+        // 会误伤这次。取消只在当次生成内有效。
+        userCancelled = false
         // 模型文件先显式校验：文件不对时直接报模型问题，绝不能放行
         // 一个错名/不完整文件去生成、最后变成误导性的空回复。
         val selectedModel = LocalServer.selectedModel(context)
@@ -325,6 +343,7 @@ object ApiClient {
         }
         val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
+        if (userCancelled) return@withContext Result.failure(Exception("已取消生成"))
         val mode = reasoningMode(context)
         // 思考模式下读超时收紧到 60 秒：思考流本身会持续来行，
         // 但 60 秒没收到任何行也该明确失败，而不是等 120 秒。
@@ -461,6 +480,11 @@ object ApiClient {
                 LocalServer.markUsed()
             }
         } catch (e: Exception) {
+            // 用户取消优先：OkHttp 断开会抛 "Canceled"，不要把它当成
+            // 普通失败、更不要走到思考超时那条“建议换回关闭”的分支。
+            if (userCancelled) {
+                return@withContext Result.failure(Exception("已取消生成"))
+            }
             val msg = e.message ?: "本地生成失败"
             val isTimeout = e is java.net.SocketTimeoutException ||
                 msg.contains("timeout", ignoreCase = true) ||
@@ -502,6 +526,8 @@ object ApiClient {
         style: String,
         postText: String
     ): Result<String> {
+        // 新的一通生成开始：清掉上一次取消留下的 flag。
+        userCancelled = false
         val selectedModel = LocalServer.selectedModel(context)
         LocalServer.validateModelFile(context, selectedModel)?.let { modelErr ->
             lastGenerationDiagnostics = "生成诊断：未调用模型（$modelErr）"
@@ -510,6 +536,9 @@ object ApiClient {
         val mode = reasoningMode(context)
         val first = doGenerate(context, contextTokens, style, postText, null, null)
         if (first.isSuccess) return first
+        // 用户已取消：直接返回，不再走下面的放宽上限/短提示词重试，
+        // 否则取消后还会再发请求，等于没取消。
+        if (userCancelled) return Result.failure(Exception("已取消生成"))
         val diag = lastGenerationDiagnostics
         val isLength = diag.contains("finish_reason=length")
         val reasoningPresent = diag.contains("reasoning_content 存在=是")
@@ -564,6 +593,9 @@ object ApiClient {
     ): Result<String> = withContext(Dispatchers.IO) {
         val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens, forcedMode)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
+        // 取消可能发生在模型加载阶段（那时还没建 OkHttp 调用可断）：
+        // 加载完先查 flag，取消了就不再发请求，直接失败。
+        if (userCancelled) return@withContext Result.failure(Exception("已取消生成"))
         val nonStreamMode = forcedMode ?: reasoningMode(context)
         // 非流式（主界面测试）同样：思考模式下 60 秒读超时即明确失败，
         // 不再静默等 120 秒；思考关时用原客户端，行为原样不动。
@@ -595,6 +627,11 @@ object ApiClient {
                 LocalServer.markUsed()
             }
         } catch (e: Exception) {
+            // 用户取消优先：OkHttp 断开会抛 "Canceled"，不要把它当成
+            // 普通失败、更不要走到思考超时那条“建议换回关闭”的分支。
+            if (userCancelled) {
+                return@withContext Result.failure(Exception("已取消生成"))
+            }
             val msg = e.message ?: "本地生成失败"
             val isTimeout = e is java.net.SocketTimeoutException ||
                 msg.contains("timeout", ignoreCase = true) || msg.contains("超时")

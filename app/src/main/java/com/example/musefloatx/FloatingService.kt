@@ -449,6 +449,15 @@ class FloatingService : Service() {
                             // 重新生成只对当前原文再生成一次，不重读剪贴板，
                             // 避免面板开着时剪贴板已被别的内容覆盖。
                             OutlinedButton(onClick = { generate() }, modifier = Modifier.padding(end = 8.dp)) { Text("重新生成") }
+                            // 取消（2026-11-02 用户要求）：生成进行中（“生成中…”或
+                            // “正在思考…”）时才出现。点取消只取消这次生成：
+                            // 代号先 +1，旧流后续块和最终结果因代号不符一律
+                            // 被挡、写不回面板；再断 HTTP、取消协程，界面
+                            // 立刻恢复空闲，不用等 60 秒超时。不改风格、
+                            // 不改思考模式、不停服务、不删模型。
+                            if (isGenerating) {
+                                OutlinedButton(onClick = { cancelGeneration() }, modifier = Modifier.padding(end = 8.dp)) { Text("取消") }
+                            }
                             // 面板整洁：点球已经读过剪贴板了，“读取剪贴板”就是多余的，
                             // 留着只会让人手滑再提交一次，已删掉。新帖子请关面板、
                             // 重新复制、再点球，那才是新的一次提交。
@@ -488,6 +497,19 @@ class FloatingService : Service() {
         store.style = s
         if (postText.isNotBlank()) generate()
     }
+    private fun cancelGeneration() {
+        // 取消这次生成：代号先 +1 是关键——旧流协程醒来后先查代号，
+        // 代号不符就直接 return，晚到的块和最终结果都写不回面板；
+        // 再断 HTTP、取消协程、恢复空闲。只取消这次，不改风格、
+        // 不改思考模式、不停服务、不删模型。点“重新生成”或换风格
+        // 仍可正常提交新的一通。
+        generateSeq += 1
+        generateJob?.cancel()
+        ApiClient.cancelGeneration()
+        isGenerating = false
+        statusText = "已取消生成，点重新生成可再试一次"
+    }
+
     private fun generate() {
         val text = postText
         if (text.isBlank()) {
