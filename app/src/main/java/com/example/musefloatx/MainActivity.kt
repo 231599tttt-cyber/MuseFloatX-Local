@@ -81,6 +81,7 @@ class MainActivity : ComponentActivity() {
                 var downloadProgress by remember { mutableStateOf("") }
                 var testResult by remember { mutableStateOf("") }
                 var diagnostic by remember { mutableStateOf("") }
+                var engineTest by remember { mutableStateOf("") }
                 var showWifiDialog by remember { mutableStateOf(false) }
                 var tick by remember { mutableStateOf(0) }
                 @Suppress("UNUSED_VARIABLE")
@@ -126,6 +127,17 @@ class MainActivity : ComponentActivity() {
                         ) { Text("开悬浮窗") }
                     }
                     OutlinedButton(onClick = { tick += 1 }) { Text("刷新权限状态") }
+                    Spacer(Modifier.height(16.dp))
+
+                    Text("先做：测试本地引擎（模型还没下载也能点，先做这一步）", fontWeight = FontWeight.Bold)
+                    Text("顺序必须是：先点下面这个按钮，确认底层引擎能启动，再下载模型。点它只会跑 llama-server --help，不带模型、不启动服务端口、不需要模型文件。它会把标准输出、标准错误、退出码、耗时全部原样显示出来。--help 能跑通（有帮助输出、退出码 0），才说明可执行文件和依赖库能正常启动；跑不通（比如 Permission denied、找不到某个 .so）就不要先去下载 1.4GB 模型，先把这段输出发回来。", fontSize = 13.sp)
+                    Button(onClick = {
+                        engineTest = "正在运行 llama-server --help…（应该几秒内出结果）"
+                        scope.launch {
+                            engineTest = LocalServer.testEngine(this@MainActivity)
+                        }
+                    }) { Text("测试本地引擎（llama-server --help）") }
+                    if (engineTest.isNotBlank()) Text(engineTest, fontSize = 12.sp)
                     Spacer(Modifier.height(16.dp))
 
                     Text("2. 本地模型：Qwen3.5-2B Q4_K_M", fontWeight = FontWeight.Bold)

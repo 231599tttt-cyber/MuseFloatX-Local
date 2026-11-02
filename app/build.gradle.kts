@@ -16,8 +16,11 @@ android {
         versionCode = 1
         versionName = "1.0-local"
     }
-    // llama-server 是 assets 里的可执行文件，不走 JNI so，不用 externalNativeBuild。
-    // 它由 GitHub Actions 里 CMake + NDK 单独编出来，再复制到 assets/llama-server。
+    // llama-server 以原生库形式打包：GitHub Actions 里 CMake + NDK 单独编出来，
+    // 再放进 app/src/main/jniLibs/arm64-v8a/libllama_server.so，不用 externalNativeBuild。
+    // 下面 packaging.jniLibs.useLegacyPackaging = true 是必须的，不要删：
+    // targetSdk 34 下默认可能是不解压（extractNativeLibs=false），那安装后
+    // nativeLibraryDir 里就不会有可执行文件，之前针对 W^X 做的原生库修复就白做了。
 
     buildTypes {
         release {
@@ -40,6 +43,11 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL,LICENSE,LGPL,NOTICE,INDEX.LIST,DEPENDENCIES}"
+        }
+        jniLibs {
+            // 明确要求传统打包：原生库真正解压到 nativeLibraryDir，App 才能执行它。
+            // 只靠默认行为不可靠，targetSdk 34 下默认可能是不解压。
+            useLegacyPackaging = true
         }
     }
 }

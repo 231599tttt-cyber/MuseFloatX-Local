@@ -152,6 +152,11 @@ jobs:
             echo "ERROR: old private-dir execution path is still in the code"
             exit 1
           fi
+          # 5) Explicit legacy-packaging settings must be present: without them
+          # targetSdk 34 may not extract the native lib to nativeLibraryDir at
+          # all, and the whole native-library fix would silently do nothing.
+          grep -q "useLegacyPackaging = true" app/build.gradle.kts || { echo "ERROR: app/build.gradle.kts is missing jniLibs.useLegacyPackaging = true"; exit 1; }
+          grep -q 'android:extractNativeLibs="true"' app/src/main/AndroidManifest.xml || { echo "ERROR: AndroidManifest.xml is missing android:extractNativeLibs=true"; exit 1; }
           if grep -q "assets" app/src/main/java/com/example/musefloatx/LocalServer.kt; then
             echo "ERROR: LocalServer.kt still references assets"
             exit 1

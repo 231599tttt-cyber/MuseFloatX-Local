@@ -122,6 +122,88 @@ object LocalServer {
         return sb.toString()
     }
 
+    /**
+     * 测试本地引擎（主界面“测试本地引擎”按钮用，模型还没下载也能点）。
+     *
+     * 只做一件事：从 nativeLibraryDir 里取 libllama_server.so，执行
+     * `llama-server --help`，不带模型参数、不启动 8080 服务端口、不需要
+     * 模型文件。等进程退出后，把标准输出、标准错误、退出码、耗时
+     * 全部原样返回给界面显示，不要只报“成功/失败”两个字。
+     *
+     * 顺序要求：--help 能跑通（有帮助输出、退出码正常），才说明可执行
+     * 文件及其依赖库能正常启动；--help 跑不通（Permission denied、
+     * 找不到某个 .so、依赖缺失、进程起不来），就不要让用户先去下载
+     * 1.4GB 模型，先把这段输出发回来定位。现有的“检查本地服务启动”
+     * 和“测试本地生成”都要求模型已下载，不能替代这个功能。
+     */
+    suspend fun testEngine(context: Context): String = withContext(Dispatchers.IO) {
+        val bin = serverBinary(context)
+        val sb = StringBuilder()
+        sb.append("原生库目录：").append(context.applicationInfo.nativeLibraryDir).append("\n")
+        sb.append("推理程序：").append(bin.absolutePath).append("\n")
+        sb.append("文件存在：").append(if (bin.exists()) "是" else "否").append("\n")
+        if (!bin.exists()) {
+            sb.append("结论：文件不存在，无法测试。请确认装的是修复后的新版 APK（APK 里应有 lib/arm64-v8a/libllama_server.so），而不是旧版。\n")
+            return@withContext sb.toString()
+        }
+        sb.append("文件大小：").append(bin.length() / 1024 / 1024).append("MB")
+        if (bin.length() < 1024 * 1024) {
+            sb.append("（小于 1MB，很可能是没带依赖的 stub，下面的 --help 很可能跑不通或缺库）")
+        }
+        sb.append("\n")
+        sb.append("可执行标记：").append(if (bin.canExecute()) "是" else "否").append("\n")
+        sb.append("执行命令：").append(bin.absolutePath).append(" --help（不带模型、不启动服务）\n")
+        try { bin.setExecutable(true) } catch (_: Exception) {}
+        val outFile = File(context.cacheDir, "engine-help-stdout.log")
+        val errFile = File(context.cacheDir, "engine-help-stderr.log")
+        try { if (outFile.exists()) outFile.delete() } catch (_: Exception) {}
+        try { if (errFile.exists()) errFile.delete() } catch (_: Exception) {}
+        val startMs = System.currentTimeMillis()
+        try {
+            val pb = ProcessBuilder(listOf(bin.absolutePath, "--help"))
+            pb.redirectOutput(outFile)
+            pb.redirectError(errFile)
+            val env = pb.environment()
+            val nativeDir = context.applicationInfo.nativeLibraryDir
+            val oldLd = env["LD_LIBRARY_PATH"]
+            env["LD_LIBRARY_PATH"] = if (oldLd.isNullOrBlank()) nativeDir else "$nativeDir:$oldLd"
+            val proc = pb.start()
+            // --help 应该几秒内退出；超过 30 秒还没退出就判超时、强制杀掉，
+            // 避免界面一直卡住（--help 本来就不该常驻）。
+            val finished = proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
+            val elapsedMs = System.currentTimeMillis() - startMs
+            sb.append("耗时：").append(elapsedMs).append(" 毫秒\n")
+            if (!finished) {
+                try { proc.destroyForcibly() } catch (_: Exception) {}
+                sb.append("退出码：（30 秒超时，未退出，已强制结束）\n")
+            } else {
+                sb.append("退出码：").append(proc.exitValue()).append("\n")
+            }
+            val stdout = try { outFile.readText() } catch (e: Exception) { "（读标准输出失败：${e.message}）" }
+            val stderr = try { errFile.readText() } catch (e: Exception) { "（读标准错误失败：${e.message}）" }
+            sb.append("---- 标准输出（原样） ----\n")
+            sb.append(if (stdout.isBlank()) "（标准输出为空）\n" else stdout.take(20000) + if (stdout.length > 20000) "\n（输出过长，已截断到 20000 字）\n" else "\n")
+            sb.append("---- 标准错误（原样） ----\n")
+            sb.append(if (stderr.isBlank()) "（标准错误为空）\n" else stderr.take(20000) + if (stderr.length > 20000) "\n（输出过长，已截断到 20000 字）\n" else "\n")
+            if (finished && proc.exitValue() == 0 && stdout.isNotBlank()) {
+                sb.append("结论：--help 跑通了，可执行文件和依赖库能正常启动，可以下一步下载模型。\n")
+            } else if (!finished) {
+                sb.append("结论：--help 30 秒都没退出，不正常。请把上面全文发回来。\n")
+            } else {
+                sb.append("结论：--help 没跑通，不要先下载模型。请把上面全文（特别是标准错误和退出码）发回来定位。\n")
+            }
+        } catch (e: Exception) {
+            // 这就是要原样显示的真实错误：Permission denied、找不到文件、
+            // 依赖库加载失败等，启动时抛出的原文就在这里。
+            val elapsedMs = System.currentTimeMillis() - startMs
+            sb.append("耗时：").append(elapsedMs).append(" 毫秒\n")
+            sb.append("启动时直接抛错，没有跑出 --help：\n")
+            sb.append(e.javaClass.simpleName).append(": ").append(e.message ?: "（无错误信息）").append("\n")
+            sb.append("结论：引擎起不来，不要先下载模型。请把上面全文发回来定位。\n")
+        }
+        sb.toString()
+    }
+
     /** 悬浮球启动时调：模型没下好直接报错，不启动空服务。 */
     suspend fun ensureStarted(context: Context, contextTokens: Int): Boolean = mutex.withLock {
         if (isRunning && process?.isAlive == true) {
