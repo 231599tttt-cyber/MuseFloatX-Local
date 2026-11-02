@@ -532,10 +532,7 @@ object ApiClient {
                 return retry
             }
             return Result.failure(
-                Exception("本地模型返回了空回复（思考模式重试思考关闭后仍为空）
-$diag
-" +
-                    "建议：保持思考关闭再试；若思考关闭也空，请检查模型文件大小与诊断")
+                Exception("本地模型返回了空回复（思考模式重试思考关闭后仍为空）\n" + diag + "\n建议：保持思考关闭再试；若思考关闭也空，请检查模型文件大小与诊断")
             )
         }
         // 思考关闭：先把上限放宽重试一次；仍空则用一句短提示词
@@ -594,13 +591,11 @@ $diag
                     val raw = resp.body?.string() ?: ""
                     if (!resp.isSuccessful) {
                         lastGenerationDiagnostics = "生成诊断：HTTP 失败，finish_reason=无；原始返回前 500 字：" + raw.take(500)
-                        return@withContext Result.failure(Exception("本地模型返回 HTTP ${resp.code}：${raw.take(500)}
-$lastGenerationDiagnostics"))
+                        return@withContext Result.failure(Exception("本地模型返回 HTTP ${resp.code}：${raw.take(500)}" + "\n" + lastGenerationDiagnostics))
                     }
                     val (text, diag) = parseGeneration(raw)
                     lastGenerationDiagnostics = diag
-                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复
-$diag"))
+                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复" + "\n" + diag))
                     else Result.success(text)
                 }
             } finally {
