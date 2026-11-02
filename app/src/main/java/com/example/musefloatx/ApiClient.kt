@@ -29,8 +29,11 @@ import java.util.concurrent.TimeUnit
  *   就地丢掉，不显示、不进最终回复。空回复时不要只猜是思考导致，
  *   看 generate() 记下的 lastGenerationDiagnostics（finish_reason、
  *   reasoning_content、tokens、过滤前/后长度）。
- * - 系统提示词沿用 V38 短句，只加一句“只输出回复正文，不要思考过程”，
- *   作为服务端开关之外的第二层保险，不是主办法。
+ * - 系统提示词（2026-11-02 用户批准，三种风格各写一个前置，不再是
+ *   V38 那句只差一个风格词的短句；推理仍关，保持快）：
+ *   自然 / 幽默 / 简短各有完整前置，见 styleSystemPrompt()。
+ *   服务端 --reasoning off 是主办法，提示词里的“不要思考过程”
+ *   只是第二层保险，不是主办法。
  * - 单飞行仍由 FloatingService 保证：这里只负责一次 HTTP 请求的取消
  *   （cancelActive），换风格时 FloatingService 先取消再提交新风格。
  *
@@ -118,12 +121,43 @@ object ApiClient {
         return if (style == "简短") 80 else 180
     }
 
-    fun styleInstruction(style: String): String {
+    /**
+     * 三种风格各自的完整系统提示词前置（2026-11-02 用户批准原样含义，
+     * 不要为了省 token 缩短：每条只有约 70 字，相对 1024 上下文可忽略，
+     * 且速度已经很快，用户明确说先不管长短）。
+     * 推理仍关（LocalServer --reasoning off），温度 0.7、
+     * max_tokens 自然/幽默 180、简短 80、上下文 1024 均不变。
+     */
+    fun styleSystemPrompt(style: String): String {
+        // 三个前置开头统一：先定身份是推特（X）的回复助手，
+        // 再接各自风格要求，避免模型把它当成通用聊天助手。
         return when (style) {
-            "幽默" -> "幽默地"
-            "简短" -> "简短地"
-            else -> "自然地"
+            "幽默" -> "你是一个推特（X）的回复助手，你是 X 上一个爱开玩笑的网友，用幽默、梗、反差、自嘲回一条，好笑但不冒犯、不低俗。笑点放后面，不要解释笑点，不要说教、不要长篇，一两句就行，只输出回复正文。不要思考过程，不要带标签。"
+            "简短" -> "你是一个推特（X）的回复助手，你是 X 上一个网友，用最短的话回一条，一句话、十几二十个字左右，接梗或者点赞式地回一句。不展开、不建议、不总结、不重复原帖，只输出回复正文。不要思考过程，不要带标签。"
+            else -> "你是一个推特（X）的回复助手，你是 X 上一个普通网友，用口语、自然地回一条，像真人聊天。贴合原帖的语气和梗，接住对方的话，不要重复原帖，不要官方腔、不要说教、不要给建议、不要总结，一两句就行，只输出回复正文。不要思考过程，不要带标签。"
         }
+    }
+
+    // 兼容旧名：内部不再用“自然地/幽默地/简短地”单字拼提示词。
+    fun styleInstruction(style: String): String = styleSystemPrompt(style)
+
+    /**
+     * 去掉生成结果开头的字面 "null" 前缀（2026-11-02 真机实测：
+     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头）。
+     * 只去开头一个前缀，且 "null" 后不能紧跟英文字母/数字
+     * （避免误伤 nullify 之类正常单词）；句中出现的 null 不动。
+     * 开头标点/空格一并清掉。流式路径的最终文本和非流式路径
+     * 都走这里，空判断之前就先清掉，免得 "null" 被当成正文显示。
+     */
+    fun stripLeadingNull(text: String): String {
+        var t = text.trim()
+        if (t.length > 4 && t.substring(0, 4).equals("null", ignoreCase = true)) {
+            val next = t[4]
+            if (!(next in 'A'..'Z' || next in 'a'..'z' || next in '0'..'9')) {
+                t = t.substring(4).trimStart(' ', '，', ',', '、', ':', '：', '·', '.', '。')
+            }
+        }
+        return t
     }
 
     /** 流式 <think> 兜底过滤器：按块处理，跨块的 <think>...</think> 也能丢掉。 */
@@ -180,7 +214,7 @@ object ApiClient {
             return if (start >= 0) text.substring(0, start) else text
         }
 
-        /** 非流式兜底：整段去掉 <think>...</think>。 */
+        /** 非流式兜底：整段去掉 <think>...</think>，再去掉开头 "null" 前缀。 */
         companion object {
             fun stripAll(text: String): String {
                 var t = text
@@ -190,14 +224,15 @@ object ApiClient {
                     val e = t.indexOf("</think>", s)
                     t = if (e < 0) t.substring(0, s) else t.substring(0, s) + t.substring(e + "</think>".length)
                 }
-                return t.trim()
+                return ApiClient.stripLeadingNull(t.trim())
             }
         }
     }
 
     private fun buildBody(style: String, postText: String, stream: Boolean): JSONObject {
-        // V38 短句 + 只输出正文（模板才是主办法，这句是第二层保险）。
-        val system = "你是一个回复助手。根据这个内容，" + styleInstruction(style) + "回复。只输出回复正文，不要思考过程。"
+        // 三种风格各用完整前置（styleSystemPrompt），不再拼 V38 短句。
+        // 推理仍关（服务端 --reasoning off），温度 0.7 不变。
+        val system = styleSystemPrompt(style)
         val user = "X 帖子：\n" + postText.take(2000) + "\n回一条，别自动发送。"
         return JSONObject().apply {
             put("model", LocalConfig.LOCAL_MODEL_NAME)
@@ -266,7 +301,9 @@ object ApiClient {
                         }
                     }
                     sb.append(filter.flush())
-                    val text = sb.toString().trim()
+                    // 流式最终文本也要去掉开头 "null" 前缀，再做空判断；
+                    // 面板最终会用这段结果覆盖流式中逐字显示的文本。
+                    val text = stripLeadingNull(sb.toString().trim())
                     if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复"))
                     else Result.success(text)
                 }
