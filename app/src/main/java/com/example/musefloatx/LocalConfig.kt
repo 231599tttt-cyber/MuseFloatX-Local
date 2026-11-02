@@ -84,11 +84,11 @@ object LocalConfig {
     const val MODEL_ORIGINAL = "Qwen/Qwen3-4B-Instruct-2507"
     /**
      * 下载 URL（文件表里的全名，否则 404）。
-     * 注意：国内直连 huggingface.co 可能 30 秒连接超时，
-     * 此时需开能上外网的 VPN 再点下载，已下载的部分可续传。
+     * 注意：2026-11-02 用户反馈官方 huggingface.co 在国内下载太慢，
+     * 故改走 hf-mirror 同文件（大小、SHA 不变）；旧 4B 卡片此前已同样走镜像。
      */
     const val MODEL_DOWNLOAD_URL =
-        "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        "https://hf-mirror.com/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
     /** 落盘文件名（与下载文件名一致的全名）。 */
     const val MODEL_FILE_NAME = "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
     /** 量化。 */
