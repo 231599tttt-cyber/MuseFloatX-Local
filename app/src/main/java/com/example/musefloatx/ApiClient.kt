@@ -183,12 +183,14 @@ object ApiClient {
         // 用户 2026-11-02 17:10 决定：纯测试版，中文前置原文，不带 X，
         // 不加语言点名、不加防冒充/防编造后缀；自然/幽默按用户原文为
         // “一两句说完”，不要擅自改回“一句话”。
-        // 这样测试结果才能归因于前置本身：若回长段、冒充作者，
-        // 下一版再把保障句加回来，不要现在就提前加。
+        // 用户 2026-11-02 17:20 反馈：模型好像没反应过来自己是在回复别人的
+        // 帖子，答得像问答而不是简短评论，所以三条前面各加一句对象说明
+        // “你正在回复别人的帖子，”，其余措辞一字不改；这样测试结果才能
+        // 归因于前置本身，若仍回长段、冒充作者，下一版再把保障句加回来。
         return when (style) {
-            "幽默" -> "像一个幽默风趣、有点嘴欠的网友，善于接梗，机灵自然，不刻意搞笑，一两句说完。"
-            "简短" -> "像真人刷推时随手回一句，直接自然，尽量简洁，不说废话。"
-            else -> "像普通网友一样接话，口语化，有自己的态度，轻松自然，一两句说完。"
+            "幽默" -> "你正在回复别人的帖子，像一个幽默风趣、有点嘴欠的网友，善于接梗，机灵自然，不刻意搞笑，一两句说完。"
+            "简短" -> "你正在回复别人的帖子，像真人刷推时随手回一句，直接自然，尽量简洁，不说废话。"
+            else -> "你正在回复别人的帖子，像普通网友一样接话，口语化，有自己的态度，轻松自然，一两句说完。"
         }
     }
 
@@ -197,17 +199,28 @@ object ApiClient {
 
     /**
      * 去掉生成结果开头的字面 "null" 前缀（2026-11-02 真机实测：
-     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头）。
-     * 只去开头一个前缀，且 "null" 后不能紧跟英文字母/数字
-     * （避免误伤 nullify 之类正常单词）；句中出现的 null 不动。
+     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头；后又实测
+     * "nullwtf？这谁啊，瞎装啊？"，null 紧贴英文俚语）。
+     * 只去开头一个前缀，句中出现的 null 不动。
+     * 收窄的豁免（2026-11-02 修复）：旧规则是 null 后紧跟
+     * 任何字母/数字都不去，结果把 "nullwtf" 漏网了。
+     * 现只豁免以 null 开头的真词：nullify（含 nullified /
+     * nullifies）与 nullification / nullity（含 nullities）
+     * ——即去掉 null 后剩余部分以 "ifi"（ify / ified / ifies /
+     * ification）或 "ity" / "ities" 开头时不动；其余情况
+     * （包括 "nullwtf"、"null123"）一律去掉开头 null。
      * 开头标点/空格一并清掉。流式路径的最终文本和非流式路径
      * 都走这里，空判断之前就先清掉，免得 "null" 被当成正文显示。
      */
     fun stripLeadingNull(text: String): String {
         var t = text.trim()
-        if (t.length > 4 && t.substring(0, 4).equals("null", ignoreCase = true)) {
-            val next = t[4]
-            if (!(next in 'A'..'Z' || next in 'a'..'z' || next in '0'..'9')) {
+        if (t.length >= 4 && t.substring(0, 4).equals("null", ignoreCase = true)) {
+            if (t.length == 4) return ""
+            val rest = t.substring(4).lowercase()
+            val isRealWord = rest.startsWith("ifi") ||
+                rest.startsWith("ity") ||
+                rest.startsWith("ities")
+            if (!isRealWord) {
                 t = t.substring(4).trimStart(' ', '，', ',', '、', ':', '：', '·', '.', '。')
             }
         }
