@@ -233,8 +233,13 @@ class MainActivity : ComponentActivity() {
                                 showDeleteConfirm = null
                                 // 删除走 ModelDownloader.deleteModel（内部 IO 线程，
                                 // 先停服务再删文件），不在主线程卡 2 秒。
+                                // 删除忙碌 key 必须带模型 id：之前 key 是共用的
+                                // “删除模型”，两张卡片的删除按钮文字都会同时
+                                // 变成“正在删除…”，看着就像两个按钮绑在一起。
+                                // 改成按卡片分开后，只有被删的那张卡片显示
+                                // “正在删除…”，另一张只变灰禁用（防重复点）。
                                 runFeedback(
-                                    key = "删除模型",
+                                    key = "删除模型-${deleteModel.id}",
                                     busyText = "正在删除 ${deleteModel.displayName}…",
                                     work = {
                                         ModelDownloader.deleteModel(this@MainActivity, deleteModel)
@@ -437,7 +442,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = { showDeleteConfirm = model },
                                 enabled = busyButton == null,
                                 modifier = Modifier.padding(start = 8.dp)
-                            ) { Text(if (busyButton == "删除模型") "正在删除…" else "删除已下载模型") }
+                            ) { Text(if (busyButton == "删除模型-${model.id}") "正在删除…" else "删除已下载模型") }
                         }
                     }
                     Spacer(Modifier.height(8.dp))

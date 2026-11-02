@@ -135,7 +135,14 @@ object ModelDownloader {
                         Exception("下载文件 SHA256 不一致（可能下载损坏或源文件已更新），已删除不完整文件，请重新下载；如果反复出现，请检查 LocalConfig 里的 SHA 是否需要更新")
                     )
                 }
-                val target = modelFile(context)
+                // 关键修复（2026-11-02 真机实测串号 bug）：
+                // 必须传 model，不能用默认参数。默认参数是当前选用模型，
+                // 之前这里写 modelFile(context) 时，下载 4B（选用仍是 2B）
+                // 会先删掉真正的 2B 正式文件，再把 4B 的 .part 改名成
+                // 2B 的文件名——结果 2B 文件里装的是 4B 内容（2873MB），
+                // 而真正的 4B 文件永远没生成；之后再删任何一个，
+                // 可用模型都是 0 个，看起来就是“删一个、两个都没了”。
+                val target = modelFile(context, model)
                 if (target.exists()) target.delete()
                 if (!part.renameTo(target)) {
                     return@withContext Result.failure(Exception("下载完成但改名失败，请重试"))
