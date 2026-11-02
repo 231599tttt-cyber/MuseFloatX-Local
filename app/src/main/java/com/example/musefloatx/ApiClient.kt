@@ -180,11 +180,14 @@ object ApiClient {
      * 上下文 1024 均不变。
      */
     fun styleSystemPrompt(style: String): String {
-        // 一句话版：身份 + 风格 + 防冒充/防编造 + 只输出正文，全部写进一个句子。
+        // 用户 2026-11-02 16:44 原文英文前置（不改措辞）+ 统一的保障句：
+        // 回简体中文、一句话、防冒充/防编造。保障句是后加的，
+        // 否则英文前置很可能直接回英文，且会丢掉此前定下的一句话与防冒充要求。
+        val safeguard = "Reply in Simplified Chinese, in one sentence. Do not impersonate the original author, do not start with '某某：', do not invent things not in the original post, output only the reply text, no thinking process, no tags."
         return when (style) {
-            "幽默" -> "你是一个推特（X）的回复助手，用幽默、梗、反差、自嘲回一句话，笑点放后面、不要解释笑点、不冒犯、不低俗，不要冒充原帖作者、不要以'某某：'开头、不要编造原帖没有的事，只输出回复正文，不要思考过程，不要带标签。"
-            "简短" -> "你是一个推特（X）的回复助手，用最短的话回一句话，十几二十个字左右，接梗或者点赞式地回一句，不要展开、建议、总结，不要冒充原帖作者、不要以'某某：'开头、不要编造原帖没有的事，只输出回复正文，不要思考过程，不要带标签。"
-            else -> "你是一个推特（X）的回复助手，用普通网友口语接梗回一句话，不要官方腔、说教、建议、总结，不要冒充原帖作者、不要以'某某：'开头、不要编造原帖没有的事，只输出回复正文，不要思考过程，不要带标签。"
+            "幽默" -> "Reply like a witty, slightly cheeky person on X. Be clever, playful, and naturally funny without forcing jokes. " + safeguard
+            "简短" -> "Reply like someone casually scrolling through X. Be direct, natural, and as concise as possible. " + safeguard
+            else -> "Reply like a regular person on X. Be casual, natural, and have your own opinion. " + safeguard
         }
     }
 
