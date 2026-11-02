@@ -57,6 +57,15 @@ jobs:
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
           ls /tmp/llama.cpp
 
+      # LocalServer.kt passes "--reasoning off" at startup. That flag must
+      # really exist in the cloned llama.cpp, otherwise the phone would
+      # repeat the --mmap failure (invalid argument, exitCode=1, service
+      # dead before loading the model). Fail the build here, not on the phone.
+      - name: Verify llama-server supports --reasoning off
+        run: |
+          grep -n '"--reasoning"' /tmp/llama.cpp/common/arg.cpp
+          grep -n 'Use reasoning/thinking' /tmp/llama.cpp/common/arg.cpp
+
       - name: Build llama-server for Android arm64-v8a and package as native library
         run: |
           cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build-android \
@@ -147,7 +156,27 @@ jobs:
           ls -lh app/src/main/jniLibs/arm64-v8a/
           file app/src/main/jniLibs/arm64-v8a/libllama_server.so || true
 
+      # Restore the persistent signing keystore from GitHub Secrets (if set).
+      # Without this, each CI run generates a fresh debug key, the APK
+      # certificate changes every build, cover-install fails with a
+      # signature conflict, and uninstalling deletes the 1.4GB model.
+      # The keystore file itself is never committed; it only exists in
+      # this runner, from the secret, and is not uploaded as an artifact.
+      - name: Restore persistent signing keystore
+        run: |
+          if [ -n "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" | base64 -d > app/signing.keystore
+            ls -lh app/signing.keystore
+          else
+            echo "WARNING: SIGNING_KEYSTORE_BASE64 secret not set, falling back to ephemeral debug signing (cover-install will fail)"
+          fi
+
       - name: Build debug APK
+        env:
+          SIGNING_KEYSTORE_PATH: ${{ github.workspace }}/app/signing.keystore
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: gradle :app:assembleDebug --console=plain --stacktrace
 
       - name: Verify APK contains the native llama-server (not a stub, no old route)
@@ -189,6 +218,16 @@ jobs:
             exit 1
           fi
           echo "APK verification passed"
+          # Print the signing certificate subject, so the build log proves
+          # whether this APK used the persistent key (CN=MuseFloatX-Local)
+          # or fell back to an ephemeral debug key (CN=Android Debug).
+          # If it fell back, cover-install over the persistent build will fail.
+          APKSIGNER="$(find "$ANDROID_HOME" -name "apksigner" -type f 2>/dev/null | head -1)"
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "$APK" || echo "WARNING: apksigner verify failed"
+          else
+            echo "WARNING: apksigner not found, cannot print signing certificate"
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

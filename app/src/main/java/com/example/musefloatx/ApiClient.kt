@@ -22,11 +22,15 @@ import java.util.concurrent.TimeUnit
  * - 生成前先调 LocalServer.ensureStarted()：悬浮球启动时加载、
  *   生成结束 10 分钟闲置自动卸载，这里的 ensureStarted 只是确认服务在跑，
  *   不会把模型常驻。
- * - 聊天模板（用户纠正）：不传自定义模板，llama-server 直接用模型自带模板，
- *   Qwen3.5-2B 官方默认就是非思考模式。下面的 ThinkFilter 只是兜底：
- *   万一流式输出里混进 <think> 段，就地丢掉，不显示、不进最终回复。
+ * - 推理开关（2026-11-02 改）：llama-server 启动时传 --reasoning off
+ *   （LocalServer.kt，已在当前 llama.cpp 源码里核实支持），
+ *   这是服务端一级的关思考办法；不优先用 --chat-template-kwargs。
+ *   下面的 ThinkFilter 只是兜底：万一输出里混进 <think> 段，
+ *   就地丢掉，不显示、不进最终回复。空回复时不要只猜是思考导致，
+ *   看 generate() 记下的 lastGenerationDiagnostics（finish_reason、
+ *   reasoning_content、tokens、过滤前/后长度）。
  * - 系统提示词沿用 V38 短句，只加一句“只输出回复正文，不要思考过程”，
- *   作为模板之外的第二层保险，不是主办法。
+ *   作为服务端开关之外的第二层保险，不是主办法。
  * - 单飞行仍由 FloatingService 保证：这里只负责一次 HTTP 请求的取消
  *   （cancelActive），换风格时 FloatingService 先取消再提交新风格。
  *
@@ -44,6 +48,70 @@ object ApiClient {
     @Volatile private var activeCall: Call? = null
     fun cancelActive() {
         try { activeCall?.cancel() } catch (_: Exception) { }
+    }
+
+    /**
+     * 最近一次非流式生成的诊断（主界面“测试本地生成”显示用）。
+     * 目的：空回复时不再只报“空回复”让用户猜原因，而是直接给出
+     * finish_reason、content 是否为空、reasoning_content 是否存在、
+     * 过滤前/后长度、实际 tokens 消耗。ThinkFilter 只是兜底，
+     * 不是诊断结论。
+     */
+    @Volatile var lastGenerationDiagnostics: String = ""
+        private set
+
+    /**
+     * 从 llama-server 的 OpenAI 兼容返回里抽诊断。
+     * 返回 Pair(过滤后的正文, 诊断文本)。reasoning_content 在不同
+     * llama.cpp 版本里可能放在 message 里，也可能放在 choice 里，
+     * 两处都查；usage 没返回时如实写“API 未返回 usage”，不编数字。
+     */
+    private fun parseGeneration(raw: String): Pair<String, String> {
+        return try {
+            val root = JSONObject(raw)
+            val choices = root.optJSONArray("choices")
+            if (choices == null || choices.length() == 0) {
+                return Pair(
+                    "",
+                    "生成诊断：返回里没有 choices（finish_reason=无；content 为空=是；" +
+                        "reasoning_content 存在=否；过滤前长度=0 字；过滤后长度=0 字；" +
+                        "tokens：API 未返回 usage；原始返回前 300 字：" + raw.take(300) + ")"
+                )
+            }
+            val choice = choices.optJSONObject(0)
+            val finishReason = choice?.optString("finish_reason", "")?.ifBlank { "(无/未返回)" } ?: "(无/未返回)"
+            val message = choice?.optJSONObject("message")
+            val content = message?.optString("content", "") ?: ""
+            var reasoning = message?.optString("reasoning_content", "") ?: ""
+            if (reasoning.isBlank()) reasoning = choice?.optString("reasoning_content", "") ?: ""
+            if (reasoning.isBlank() && message != null && message.has("reasoning")) {
+                reasoning = message.optString("reasoning", "")
+            }
+            val usage = root.optJSONObject("usage")
+            val usageText = if (usage == null) {
+                "API 未返回 usage"
+            } else {
+                "prompt_tokens=" + usage.optInt("prompt_tokens", -1).let { if (it < 0) "(未返回)" else it.toString() } +
+                    "，completion_tokens=" + usage.optInt("completion_tokens", -1).let { if (it < 0) "(未返回)" else it.toString() } +
+                    "，total_tokens=" + usage.optInt("total_tokens", -1).let { if (it < 0) "(未返回)" else it.toString() }
+            }
+            val stripped = ThinkFilter.stripAll(content)
+            val preview = content.take(200).replace("\n", " ")
+            val diag = "生成诊断：finish_reason=" + finishReason +
+                "；content 是否为空=" + if (content.isBlank()) "是" else "否" +
+                "；reasoning_content 存在=" + if (reasoning.isBlank()) "否" else "是" +
+                "（长度=" + reasoning.length + " 字）" +
+                "；content 过滤前长度=" + content.length + " 字" +
+                "；过滤 <think> 后长度=" + stripped.length + " 字" +
+                "；tokens：" + usageText +
+                "；原始 content 前 200 字：" + if (preview.isBlank()) "(空)" else preview
+            Pair(stripped, diag)
+        } catch (e: Exception) {
+            Pair(
+                "",
+                "生成诊断：解析返回 JSON 失败（" + (e.message ?: "无错误信息") + "）；原始返回前 300 字：" + raw.take(300)
+            )
+        }
     }
 
     fun maxTokensForStyle(style: String): Int {
@@ -232,15 +300,12 @@ object ApiClient {
                 call.execute().use { resp ->
                     val raw = resp.body?.string() ?: ""
                     if (!resp.isSuccessful) {
-                        return@withContext Result.failure(Exception("本地模型返回 HTTP ${resp.code}：${raw.take(500)}"))
+                        lastGenerationDiagnostics = "生成诊断：HTTP 失败，finish_reason=无；原始返回前 500 字：" + raw.take(500)
+                        return@withContext Result.failure(Exception("本地模型返回 HTTP ${resp.code}：${raw.take(500)}\n$lastGenerationDiagnostics"))
                     }
-                    val content = JSONObject(raw)
-                        .getJSONArray("choices")
-                        .getJSONObject(0)
-                        .getJSONObject("message")
-                        .optString("content", "")
-                    val text = ThinkFilter.stripAll(content)
-                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复"))
+                    val (text, diag) = parseGeneration(raw)
+                    lastGenerationDiagnostics = diag
+                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复\n$diag"))
                     else Result.success(text)
                 }
             } finally {
@@ -252,9 +317,17 @@ object ApiClient {
         }
     }
 
-    /** 主界面“测试本地生成”用：模型没下好、服务起不来都会直接报原因。 */
+    /**
+     * 主界面“测试本地生成”用：模型没下好、服务起不来都会直接报原因。
+     * 成功和失败都把生成诊断附在结果后面显示在主界面上，
+     * 失败时 generate() 里已经带了诊断，这里不再重复；成功时把
+     * lastGenerationDiagnostics 一并附上，方便对照 tokens 和 finish_reason。
+     */
     suspend fun testLocal(context: Context, contextTokens: Int): Result<String> {
         return generate(context, contextTokens, "自然", "你好")
-            .map { if (it.isBlank()) "本地连接成功（返回为空）" else it }
+            .map { text ->
+                val diag = lastGenerationDiagnostics
+                if (diag.isBlank()) text else text + "\n\n---- 生成诊断 ----\n" + diag
+            }
     }
 }

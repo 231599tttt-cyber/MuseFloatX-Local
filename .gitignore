@@ -1,0 +1,6 @@
+# Never commit signing material: the persistent signing keystore is
+# restored in CI from GitHub Secrets only. If this file were committed,
+# anyone could sign updates to this package.
+*.keystore
+*.jks
+signing.keystore

@@ -246,6 +246,19 @@ object LocalServer {
                 // 注意：不要传 --mmap，新版 llama-server 不认这个参数，
                 // 传了就报 invalid argument: --mmap、exitCode=1 提前退出。
                 // mmap 本来就是默认的，不传就是 mmap。
+                // 推理开关（2026-11-02 实测验证，非假设）：
+                // 当前工作流克隆的最新 llama.cpp 里 common/arg.cpp 明确有
+                // {"-rea", "--reasoning"}, "[on|off|auto]",
+                // "Use reasoning/thinking in the chat ('on', 'off', or 'auto',
+                // default: 'auto' (detect from template))"，
+                // 所以 --reasoning off 是本版 llama-server 真实支持的参数，
+                // 不是猜的。用户明确要求不要优先用 --chat-template-kwargs，
+                // 因此这里只用 --reasoning off，不传 --chat-template-kwargs。
+                // 如果将来 llama.cpp 删掉这个参数，启动会像 --mmap 那样
+                // 直接报 invalid argument、exitCode=1，工作流里有
+                // grep 校验（见 .github/workflows/build-local-apk.yml），
+                // 缺了这个参数定义就先构建失败，不会静默发一个坏 APK。
+                "--reasoning", "off",
                 "-b", "512",
                 "--log-disable"
                 // 注意：故意不传 --chat-template，让模型自带模板决定非思考模式。
