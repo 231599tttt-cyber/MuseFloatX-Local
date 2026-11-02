@@ -109,10 +109,31 @@ object LocalServer {
 
     /** 指定模型是否已下载：文件存在且大小在官方大小 ±1% 内才算。 */
     fun isModelDownloaded(context: Context, model: LocalModel = selectedModel(context)): Boolean {
+        return validateModelFile(context, model) == null
+    }
+
+    /**
+     * 模型文件显式校验（2026-11-02 空回复排查要求）：
+     * 返回 null = 文件可用；否则返回一句直接原因，调用方必须原样
+     * 显示给用户，绝不能把它掩盖成“本地模型返回了空回复”。
+     * 重点防两种真机状态：(a) 之前串号留下的错名文件——顶着 2B
+     * 文件名、装着 4B 内容（2873MB），大小与 2B 期望 1331MB 差
+     * 远超 ±1%；(b) 下载不完整、只有 .part、正式文件不存在。
+     * 注意：大小校验不能发现“大小恰好对但 SHA 不对”的损坏文件，
+     * 那种情况仍可能生成失败，诊断里要写清文件大小以便对照。
+     */
+    fun validateModelFile(context: Context, model: LocalModel = selectedModel(context)): String? {
         val f = modelFile(context, model)
-        // 大小校验：必须接近官方大小，差 1% 以上算没下完或损坏。
-        return f.exists() && f.length() > model.expectedBytes * 99 / 100 &&
-            f.length() < model.expectedBytes * 101 / 100
+        if (!f.exists()) {
+            return "模型还没下载好：当前选用的是 ${model.displayName}，请先回主界面下载它（${model.approxSizeLabel}），或先切换回已下载的模型"
+        }
+        val actualMb = f.length() / 1024 / 1024
+        val expectedMb = model.expectedBytes / 1024 / 1024
+        if (f.length() <= model.expectedBytes * 99 / 100 || f.length() >= model.expectedBytes * 101 / 100) {
+            return "模型文件大小不对：当前选用的是 ${model.displayName}，文件实际约 ${actualMb}MB，期望约 ${expectedMb}MB" +
+                "（可能是之前串号留下的错名文件或下载不完整），请删除该模型后重新下载，不要直接生成"
+        }
+        return null
     }
 
     /** 原生库目录里的推理程序：APK 安装时从 lib/arm64-v8a/ 解压到这里。 */
@@ -157,8 +178,12 @@ object LocalServer {
         sb.append("当前模型文件：").append(modelFile(context, selected).absolutePath).append("\n")
         sb.append("当前模型已下载：").append(if (isModelDownloaded(context, selected)) "是" else "否").append("\n")
         for (m in LocalConfig.MODELS) {
+            val mf = modelFile(context, m)
+            val sizeTxt = if (mf.exists()) "约 " + (mf.length() / 1024 / 1024) + "MB" else "文件不存在"
             sb.append("模型 ").append(m.displayName).append(" 已下载：")
-                .append(if (isModelDownloaded(context, m)) "是" else "否").append("\n")
+                .append(if (isModelDownloaded(context, m)) "是" else "否")
+                .append("（文件大小：").append(sizeTxt).append("，期望约 ")
+                .append(m.expectedBytes / 1024 / 1024).append("MB）\n")
         }
         sb.append("服务在跑：").append(if (isRunning && process?.isAlive == true) "是" else "否").append("\n")
         sb.append("最后一次报错：").append(lastError ?: "（无）").append("\n")
@@ -248,9 +273,11 @@ object LocalServer {
         sb.toString()
     }
 
-    /** 悬浮球启动时调：模型没下好直接报错，不启动空服务。 */
-    suspend fun ensureStarted(context: Context, contextTokens: Int): Boolean = mutex.withLock {
-        val wantedReasoning = reasoningMode(context)
+    /** 悬浮球启动时调：模型没下好直接报错，不启动空服务。
+     * reasoningOverride 非空时用它启动（仅供空回复重试时临时用思考关闭
+     * 重生成一次，不改用户持久化的思考模式选择）。 */
+    suspend fun ensureStarted(context: Context, contextTokens: Int, reasoningOverride: String? = null): Boolean = mutex.withLock {
+        val wantedReasoning = reasoningOverride ?: reasoningMode(context)
         if (isRunning && process?.isAlive == true) {
             if (runningReasoningMode == wantedReasoning) {
                 cancelIdleUnloadLocked()
@@ -258,17 +285,34 @@ object LocalServer {
             }
             // 思考模式被用户改了：只改设置不重启是不会生效的，
             // 这里先杀掉用旧模式跑的服务，下面按新模式重新启动。
-            // stop() 里有 2 秒等待，但它不抢 mutex，不会死锁。
+            // 关键修复（2026-11-02 空回复排查）：杀旧服务后必须等端口
+            // 真正释放再起新服务，否则新服务绑不上 8080、而 /health
+            // 仍由旧服务回 200，ensureStarted 会误判“新模式已起”，
+            // 实际上跑的还是旧模式——用户切回思考关闭，生成走的
+            // 还是思考开/自动的服务，正文就可能被思考耗尽变空。
+            // stop() 不抢 mutex，不会死锁；这里等旧进程死 + 端口空闲。
             try { process?.destroyForcibly() } catch (_: Exception) {}
             process = null
             isRunning = false
             runningReasoningMode = null
+            var waitedMs = 0
+            while (waitedMs < 10_000 && isHealthy()) {
+                delay(200)
+                waitedMs += 200
+            }
+            if (isHealthy()) {
+                lastError = "旧服务未退出、8080 端口仍被占用：请先点“停止（同时卸载模型）”彻底停掉悬浮球，等几秒再试"
+                return false
+            }
         }
         // 关键：按当前选用模型加载，不再写死 2B。切换模型后这里读到的
         // 就是新模型的文件和 alias；旧模型文件还留在手机里，不会被删。
+        // 模型文件先显式校验：不存在、大小不对都直接报模型问题，
+        // 绝不能放行一个错名/不完整文件去生成、最后变成误导性空回复。
         val selected = selectedModel(context)
-        if (!isModelDownloaded(context, selected)) {
-            lastError = "模型还没下载好：当前选用的是 ${selected.displayName}，请先回主界面下载它（${selected.approxSizeLabel}），或先切换回已下载的模型"
+        val modelErr = validateModelFile(context, selected)
+        if (modelErr != null) {
+            lastError = modelErr
             return false
         }
         val bin = serverBinary(context)
@@ -396,31 +440,42 @@ object LocalServer {
         idleJob = null
     }
 
-    /** 悬浮球关闭 / 10 分钟闲置时调：杀掉 llama-server，释放模型内存。 */
+    /** 悬浮球关闭 / 10 分钟闲置时调：杀掉 llama-server，释放模型内存。
+     * 修复（2026-11-02）：不再固定睡 2 秒就了事——旧服务若 2 秒内
+     * 没死透，下一次启动会在旧端口上冲突或误用旧服务。改为轮询：
+     * 先优雅退出、最多等 5 秒，仍活着再强制杀、最多再等 5 秒，
+     * 这样 stop() 返回时旧进程基本已死，切换思考模式才不会悬着。 */
     fun stop() {
         idleJob?.cancel()
         idleJob = null
-        try { process?.destroy() } catch (_: Exception) {}
+        val p = process
+        try { p?.destroy() } catch (_: Exception) {}
+        var waited = 0
+        while (p != null && p.isAlive && waited < 5000) {
+            try { Thread.sleep(100) } catch (_: Exception) { break }
+            waited += 100
+        }
         try {
-            // 给 2 秒优雅退出，退不掉再强制杀。
-            Thread.sleep(2000)
+            if (p != null && p.isAlive) p.destroyForcibly()
         } catch (_: Exception) {}
-        try {
-            if (process?.isAlive == true) process?.destroyForcibly()
-        } catch (_: Exception) {}
+        waited = 0
+        while (p != null && p.isAlive && waited < 5000) {
+            try { Thread.sleep(100) } catch (_: Exception) { break }
+            waited += 100
+        }
         process = null
         isRunning = false
         runningReasoningMode = null
     }
 
     /** 供 MainActivity 测试/诊断用：不经过 FloatingService 也能起服务，测完同样会闲置卸载。 */
-    suspend fun ensureStartedForTest(context: Context, contextTokens: Int): Boolean {
-        return ensureStarted(context, contextTokens)
+    suspend fun ensureStartedForTest(context: Context, contextTokens: Int, reasoningOverride: String? = null): Boolean {
+        return ensureStarted(context, contextTokens, reasoningOverride)
     }
 
     /** 给 ApiClient 用：生成前确保服务在跑，否则返回失败原因（带真实报错原文）。 */
-    suspend fun ensureStartedForGenerate(context: Context, contextTokens: Int): String? {
-        val ok = ensureStarted(context, contextTokens)
+    suspend fun ensureStartedForGenerate(context: Context, contextTokens: Int, reasoningOverride: String? = null): String? {
+        val ok = ensureStarted(context, contextTokens, reasoningOverride)
         return if (ok) null else (lastError ?: "本地模型未启动")
     }
 }

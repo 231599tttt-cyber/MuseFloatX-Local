@@ -269,7 +269,7 @@ object ApiClient {
         }
     }
 
-    private fun buildBody(style: String, postText: String, stream: Boolean, modelAlias: String, reasoningMode: String = "off"): JSONObject {
+    private fun buildBody(style: String, postText: String, stream: Boolean, modelAlias: String, reasoningMode: String = "off", maxTokensOverride: Int? = null): JSONObject {
         // 三种风格各用完整前置（styleSystemPrompt），不再拼 V38 短句。
         // 思考模式默认关、可选（服务端 --reasoning 跟随用户选择），温度 0.7 不变。
         // max_tokens 跟随思考模式：思考开/自动时抬高，防思考耗尽预算出空回复。
@@ -282,7 +282,7 @@ object ApiClient {
             put("model", modelAlias)
             put("stream", stream)
             put("temperature", 0.7)
-            put("max_tokens", maxTokensForStyle(style, reasoningMode))
+            put("max_tokens", maxTokensOverride ?: maxTokensForStyle(style, reasoningMode))
             put("messages", JSONArray().apply {
                 put(JSONObject().apply { put("role", "system"); put("content", system) })
                 put(JSONObject().apply { put("role", "user"); put("content", user) })
@@ -313,6 +313,12 @@ object ApiClient {
         onDelta: (String) -> Unit,
         onReasoning: () -> Unit = {}
     ): Result<String> = withContext(Dispatchers.IO) {
+        // 模型文件先显式校验：文件不对时直接报模型问题，绝不能放行
+        // 一个错名/不完整文件去生成、最后变成误导性的空回复。
+        val selectedModel = LocalServer.selectedModel(context)
+        LocalServer.validateModelFile(context, selectedModel)?.let { modelErr ->
+            return@withContext Result.failure(Exception(modelErr))
+        }
         val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
         val mode = reasoningMode(context)
@@ -469,15 +475,81 @@ object ApiClient {
         }
     }
 
+    /**
+     * 非流式生成（主界面“测试本地生成”用），带一次有用的重试：
+     * - 第 0 步先显式校验模型文件：不存在、大小不对（例如之前串号
+     *   留下的 2873MB 错名文件）直接报模型问题，绝不放行去生成、
+     *   最后变成误导性的“空回复”。
+     * - 思考模式下正文为空且思考非空、finish_reason=length：自动用
+     *   思考关闭重生成一次（临时 override，不改用户持久化的思考
+     *   模式选择；下次生成仍按用户选择重启），这次能出正文就返回
+     *   正文并在诊断里写明已重试；再空才报失败。
+     * - 思考关闭下正文为空且 finish_reason=length：说明模型在
+     *   180 token 内只输出了思考/标签就被截断，重试一次把上限
+     *   放到 400（自然/幽默）/200（简短），仍在 1024 上下文内，
+     *   给模型留出走出思考段、说出正文的空间。
+     * - 最多重试一次，绝不循环重试。面板流式路径不走这里，仍遵守
+     *   单飞行、不自动第二通的规则。
+     */
     suspend fun generate(
         context: Context,
         contextTokens: Int,
         style: String,
         postText: String
+    ): Result<String> {
+        val selectedModel = LocalServer.selectedModel(context)
+        LocalServer.validateModelFile(context, selectedModel)?.let { modelErr ->
+            lastGenerationDiagnostics = "生成诊断：未调用模型（$modelErr）"
+            return Result.failure(Exception(modelErr))
+        }
+        val mode = reasoningMode(context)
+        val first = doGenerate(context, contextTokens, style, postText, null, null)
+        if (first.isSuccess) return first
+        val diag = lastGenerationDiagnostics
+        val isLength = diag.contains("finish_reason=length")
+        val reasoningPresent = diag.contains("reasoning_content 存在=是")
+        val isBlankFailure = first.exceptionOrNull()?.message?.contains("空回复") == true
+        if (!isBlankFailure || !isLength) return first
+        // 思考模式：用思考关闭重生成一次（临时 override，不改用户设置）。
+        if (mode != "off" && reasoningPresent) {
+            val retry = doGenerate(context, contextTokens, style, postText, "off", null)
+            if (retry.isSuccess) {
+                lastGenerationDiagnostics = lastGenerationDiagnostics +
+                    "（注意：思考模式下首次生成正文为空，已自动用思考关闭重生成一次并成功；用户思考模式选择未改）"
+                return retry
+            }
+            return Result.failure(
+                Exception("本地模型返回了空回复（思考模式重试思考关闭后仍为空）
+$diag
+" +
+                    "建议：保持思考关闭再试；若思考关闭也空，请检查模型文件大小与诊断")
+            )
+        }
+        // 思考关闭：把上限放宽重试一次。
+        if (mode == "off") {
+            val bigger = if (style == "简短") 200 else 400
+            val retry = doGenerate(context, contextTokens, style, postText, "off", bigger)
+            if (retry.isSuccess) {
+                lastGenerationDiagnostics = lastGenerationDiagnostics +
+                    "（注意：首次生成在 180/80 token 内被截断为空，已自动放宽上限到 $bigger 重生成一次并成功）"
+                return retry
+            }
+        }
+        return first
+    }
+
+    /** 非流式生成的一次实际请求（forcedMode 非空时临时用该思考模式启动服务，不改用户设置）。 */
+    private suspend fun doGenerate(
+        context: Context,
+        contextTokens: Int,
+        style: String,
+        postText: String,
+        forcedMode: String?,
+        maxTokensOverride: Int?
     ): Result<String> = withContext(Dispatchers.IO) {
-        val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens)
+        val startErr = LocalServer.ensureStartedForGenerate(context, contextTokens, forcedMode)
         if (startErr != null) return@withContext Result.failure(Exception(startErr))
-        val nonStreamMode = reasoningMode(context)
+        val nonStreamMode = forcedMode ?: reasoningMode(context)
         // 非流式（主界面测试）同样：思考模式下 60 秒读超时即明确失败，
         // 不再静默等 120 秒；思考关时用原客户端，行为原样不动。
         val nonStreamClient = if (nonStreamMode == "off") client
@@ -487,7 +559,7 @@ object ApiClient {
                 .url("${LocalConfig.LOCAL_BASE_URL}/v1/chat/completions")
                 .addHeader("Authorization", "Bearer local")
                 .addHeader("Content-Type", "application/json")
-                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, nonStreamMode).toString().toRequestBody("application/json".toMediaType()))
+                .post(buildBody(style, postText, false, LocalServer.selectedModel(context).alias, nonStreamMode, maxTokensOverride).toString().toRequestBody("application/json".toMediaType()))
                 .build()
             val call = nonStreamClient.newCall(req)
             activeCall = call
@@ -496,11 +568,13 @@ object ApiClient {
                     val raw = resp.body?.string() ?: ""
                     if (!resp.isSuccessful) {
                         lastGenerationDiagnostics = "生成诊断：HTTP 失败，finish_reason=无；原始返回前 500 字：" + raw.take(500)
-                        return@withContext Result.failure(Exception("本地模型返回 HTTP ${resp.code}：${raw.take(500)}\n$lastGenerationDiagnostics"))
+                        return@withContext Result.failure(Exception("本地模型返回 HTTP ${resp.code}：${raw.take(500)}
+$lastGenerationDiagnostics"))
                     }
                     val (text, diag) = parseGeneration(raw)
                     lastGenerationDiagnostics = diag
-                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复\n$diag"))
+                    if (text.isBlank()) Result.failure(Exception("本地模型返回了空回复
+$diag"))
                     else Result.success(text)
                 }
             } finally {
@@ -523,6 +597,7 @@ object ApiClient {
             }
         }
     }
+
 
     /**
      * 主界面“测试本地生成”用：模型没下好、服务起不来都会直接报原因。

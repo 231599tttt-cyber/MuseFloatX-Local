@@ -162,16 +162,24 @@ class MainActivity : ComponentActivity() {
                     busyButton = key
                     actionMessage = busyText
                     scope.launch {
-                        val result = try {
-                            work()
-                        } catch (e: Exception) {
-                            "失败：${e.message ?: "未知错误"}"
+                        // 修复（2026-11-02 思考切换卡住）：busyButton 必须在
+                        // finally 里清掉，否则 work 一旦被取消/异常中断，
+                        // 按钮会永久停在“正在切换…”、测试按钮一直变灰。
+                        // work 本身只做停服务 + 改设置，应在几秒内完成；
+                        // 若真超时，finally 仍会放行按钮并显示失败原因。
+                        try {
+                            val result = try {
+                                work()
+                            } catch (e: Exception) {
+                                "失败：${e.message ?: "未知错误"}"
+                            }
+                            onResult?.invoke(result)
+                            actionMessage = result
+                            toastLong(result)
+                        } finally {
+                            busyButton = null
+                            tick += 1
                         }
-                        onResult?.invoke(result)
-                        actionMessage = result
-                        toastLong(result)
-                        busyButton = null
-                        tick += 1
                     }
                 }
 
@@ -499,7 +507,12 @@ class MainActivity : ComponentActivity() {
                             "auto" to "自动",
                             "on" to "开启（慢但可能更准）"
                         ).forEach { (mode, label) ->
-                            val buttonText = if (busyButton == "切换思考模式") "正在切换…" else label
+                            // 修复（2026-11-02 截图假象）：旧 key 是共用的
+                            // “切换思考模式”，切一个模式时三个按钮里未选中的
+                            // 两个都会同时显示“正在切换…”，看着像卡住了。
+                            // 改成按模式分开的 key，只有被点的那个按钮变
+                            // “正在切换…”，其他按钮只变灰禁用。
+                            val buttonText = if (busyButton == "切换思考模式-$mode") "正在切换…" else label
                             if (reasoningMode == mode) {
                                 Button(
                                     onClick = {
@@ -519,7 +532,7 @@ class MainActivity : ComponentActivity() {
                                         // 旧服务没停干净时，ensureStarted() 里还有
                                         // 一层模式不一致就杀旧重起的兜底。
                                         runFeedback(
-                                            key = "切换思考模式",
+                                            key = "切换思考模式-$mode",
                                             busyText = "正在切换思考模式到$label…",
                                             work = {
                                                 withContext(Dispatchers.IO) {
