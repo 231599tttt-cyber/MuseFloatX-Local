@@ -477,7 +477,7 @@ class MainActivity : ComponentActivity() {
 
                     Text("4. 风格（默认风格，面板里也能换）", fontWeight = FontWeight.Bold)
                     Row {
-                        listOf("自然", "幽默", "简短").forEach { s ->
+                        listOf("自然", "幽默", "简短", "友好").forEach { s ->
                             if (style == s) {
                                 Button(
                                     onClick = {

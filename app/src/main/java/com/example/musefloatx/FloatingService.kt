@@ -421,7 +421,7 @@ class FloatingService : Service() {
                         // 再点球就是新的一次提交，不再留一个多余的生成按钮。
                         Text("风格", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                         Row {
-                            listOf("自然", "幽默", "简短").forEach { s ->
+                            listOf("自然", "幽默", "简短", "友好").forEach { s ->
                                 val selected = styleState == s
                                 if (selected) {
                                     // 已选中的风格永远保持紫色、不变灰：之前生成中把它置灰，
