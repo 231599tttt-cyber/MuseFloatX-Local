@@ -34,7 +34,10 @@ import java.net.URL
  *
  * 打包方式：
  * - GitHub Actions 里用 CMake + Android NDK 编 llama-server（arm64-v8a），
- *   产物放在 app/src/main/assets/llama-server，APK 里带上。
+ *   必须用 -DBUILD_SHARED_LIBS=OFF 静态编译，产物放在 app/src/main/assets/llama-server，APK 里带上。
+ *   默认的动态编译只会产出一个约 7KB 的 stub，运行时要找 libllama.so / libggml.so，
+ *   那些 .so 不在 APK 里，手机上一定起不来——工作流里已加检查，抓到这种 stub 就直接失败，
+ *   不会把它打进 APK 蒙混过去。
  * - 首次使用时把 assets 里的 llama-server 复制到 filesDir/bin/llama-server
  *   并 chmod +x，然后 ProcessBuilder 启动它。assets 里的文件不能直接执行，
  *   必须先复制出来，这一步是必须的，不是可选项。

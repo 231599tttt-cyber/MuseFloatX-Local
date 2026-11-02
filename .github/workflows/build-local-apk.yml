@@ -64,6 +64,7 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=ON \
@@ -73,11 +74,19 @@ jobs:
             -DGGML_VULKAN=OFF \
             -DGGML_OPENCL=OFF
           cmake --build /tmp/llama.cpp/build-android --target llama-server -j"$(nproc)"
-          ls -lh /tmp/llama.cpp/build-android/bin/ || ls -lh /tmp/llama.cpp/build-android/tools/server/ || true
-          # llama.cpp puts the binary in bin/ in recent versions; fall back to a find.
-          BIN="$(find /tmp/llama.cpp/build-android -maxdepth 3 -name llama-server -type f | head -1)"
+          # CRITICAL: llama.cpp's default build produces a ~7KB llama-server stub
+          # that dynamically links libllama.so / libggml.so etc. That stub alone
+          # will fail on a phone (missing .so files). BUILD_SHARED_LIBS=OFF above
+          # forces a static, self-contained binary. Fail the build if we get the stub.
+          BIN="$(find /tmp/llama.cpp/build-android -maxdepth 3 -name llama-server -type f -size +1M | head -1)"
           echo "llama-server binary: $BIN"
           test -n "$BIN"
+          ls -lh "$BIN"
+          # The static binary must NOT depend on libllama / libggml at runtime.
+          if readelf -d "$BIN" 2>/dev/null | grep -E "libllama|libggml|libmtmd"; then
+            echo "ERROR: llama-server still links shared llama/ggml libs, refusing to package it"
+            exit 1
+          fi
           mkdir -p app/src/main/assets
           cp "$BIN" app/src/main/assets/llama-server
           ls -lh app/src/main/assets/llama-server
