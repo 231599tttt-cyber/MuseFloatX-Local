@@ -199,17 +199,32 @@ object ApiClient {
 
     /**
      * 去掉生成结果开头的字面 "null" 前缀（2026-11-02 真机实测：
-     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头）。
-     * 只去开头一个前缀，且 "null" 后不能紧跟英文字母/数字
-     * （避免误伤 nullify 之类正常单词）；句中出现的 null 不动。
-     * 开头标点/空格一并清掉。流式路径的最终文本和非流式路径
+     * 回复以 "null恭喜 X 获得 10 万粉丝！" 开头；后又出现 "nullwtf"）。
+     * 只去开头一个前缀；句中出现的 null 不动；整段恰好就是 "null"
+     * 时返回空串，走已有的空回复处理。
+     * 豁免的真词续写只有 nullify 家族：nullify / nullification /
+     * nullity / nullified / nullifies / nullifying（及其复数），
+     * 因为它们是正常英文单词。其余情况哪怕 null 后紧跟字母
+     * （如 nullwtf、nullhello、null恭喜）一律去掉，
+     * 否则 "nullwtf" 会漏网。流式路径的最终文本和非流式路径
      * 都走这里，空判断之前就先清掉，免得 "null" 被当成正文显示。
+     * 流式防闪烁：调用处在累积文本仍是 "null" 前缀（1-4 字）时
+     * 一字不发，等下一块来了再由本函数决定去留，所以面板上
+     * 不会先闪 "null" 再跳变。
      */
     fun stripLeadingNull(text: String): String {
         var t = text.trim()
+        if (t.equals("null", ignoreCase = true)) return ""
         if (t.length > 4 && t.substring(0, 4).equals("null", ignoreCase = true)) {
-            val next = t[4]
-            if (!(next in 'A'..'Z' || next in 'a'..'z' || next in '0'..'9')) {
+            val remainder = t.substring(4).lowercase()
+            val isRealWord = remainder.startsWith("ify") ||
+                remainder.startsWith("ification") ||
+                remainder.startsWith("ified") ||
+                remainder.startsWith("ifies") ||
+                remainder.startsWith("ifying") ||
+                remainder.startsWith("ity") ||
+                remainder.startsWith("ities")
+            if (!isRealWord) {
                 t = t.substring(4).trimStart(' ', '，', ',', '、', ':', '：', '·', '.', '。')
             }
         }
@@ -425,10 +440,11 @@ object ApiClient {
                                     sb.append(visible)
                                     val raw = sb.toString()
                                     // 分块可能把 "null" 切开（"nu"+"ll…"）：
-                                    // 累积文本还是 "null" 的前缀时先一字不发，
-                                    // 等下一块来了再判断，避免先闪 "nu" 再跳变。
-                                    val isNullPrefix = raw.length in 1..4 &&
-                                        "null".startsWith(raw.lowercase())
+                                    // 累积文本（去前导空白后）还是 "null" 的前缀时先一字不发，
+                                    // 等下一块来了再判断，避免先闪 "nu"/"null" 再跳变。
+                                    val trimmedRaw = raw.trimStart()
+                                    val isNullPrefix = trimmedRaw.length in 1..4 &&
+                                        "null".startsWith(trimmedRaw.lowercase())
                                     if (!isNullPrefix) {
                                         val cleaned = stripLeadingNull(raw)
                                         if (cleaned.length > emitted.length) {
