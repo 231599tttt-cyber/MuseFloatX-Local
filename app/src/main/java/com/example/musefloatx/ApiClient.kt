@@ -180,14 +180,14 @@ object ApiClient {
      * 上下文 1024 均不变。
      */
     fun styleSystemPrompt(style: String): String {
-        // 用户 2026-11-02 16:44 原文英文前置（不改措辞）+ 统一的保障句：
-        // 回简体中文、一句话、防冒充/防编造。保障句是后加的，
-        // 否则英文前置很可能直接回英文，且会丢掉此前定下的一句话与防冒充要求。
-        val safeguard = "Reply in Simplified Chinese, in one sentence. Do not impersonate the original author, do not start with '某某：', do not invent things not in the original post, output only the reply text, no thinking process, no tags."
+        // 用户 2026-11-02 16:44-16:46 决定：纯测试版，英文前置原文，不带 X，
+        // 不加语言点名、不加一句话约束、不加防冒充/防编造后缀。
+        // 这样测试结果才能归因于前置本身：若回英文、回长段、冒充作者，
+        // 下一版再把保障句加回来，不要现在就提前加。
         return when (style) {
-            "幽默" -> "Reply like a witty, slightly cheeky person on X. Be clever, playful, and naturally funny without forcing jokes. " + safeguard
-            "简短" -> "Reply like someone casually scrolling through X. Be direct, natural, and as concise as possible. " + safeguard
-            else -> "Reply like a regular person on X. Be casual, natural, and have your own opinion. " + safeguard
+            "幽默" -> "Reply like a witty, slightly cheeky person. Be clever, playful, and naturally funny without forcing jokes."
+            "简短" -> "Reply like someone casually scrolling through. Be direct, natural, and as concise as possible."
+            else -> "Reply like a regular person. Be casual, natural, and have your own opinion."
         }
     }
 
