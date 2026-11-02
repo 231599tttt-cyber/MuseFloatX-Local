@@ -180,14 +180,15 @@ object ApiClient {
      * 上下文 1024 均不变。
      */
     fun styleSystemPrompt(style: String): String {
-        // 用户 2026-11-02 16:44-16:46 决定：纯测试版，英文前置原文，不带 X，
-        // 不加语言点名、不加一句话约束、不加防冒充/防编造后缀。
-        // 这样测试结果才能归因于前置本身：若回英文、回长段、冒充作者，
+        // 用户 2026-11-02 17:10 决定：纯测试版，中文前置原文，不带 X，
+        // 不加语言点名、不加防冒充/防编造后缀；自然/幽默按用户原文为
+        // “一两句说完”，不要擅自改回“一句话”。
+        // 这样测试结果才能归因于前置本身：若回长段、冒充作者，
         // 下一版再把保障句加回来，不要现在就提前加。
         return when (style) {
-            "幽默" -> "Reply like a witty, slightly cheeky person. Be clever, playful, and naturally funny without forcing jokes."
-            "简短" -> "Reply like someone casually scrolling through. Be direct, natural, and as concise as possible."
-            else -> "Reply like a regular person. Be casual, natural, and have your own opinion."
+            "幽默" -> "像一个幽默风趣、有点嘴欠的网友，善于接梗，机灵自然，不刻意搞笑，一两句说完。"
+            "简短" -> "像真人刷推时随手回一句，直接自然，尽量简洁，不说废话。"
+            else -> "像普通网友一样接话，口语化，有自己的态度，轻松自然，一两句说完。"
         }
     }
 
